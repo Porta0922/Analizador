@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "eCLUB - ID Auto Verifier",
+  "version": "1.0",
+  "permissions": ["activeTab", "scripting"],
+  "content_scripts": [
+    {
+      "matches": ["*://*/onboarding/solicitudes/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "all_frames": true
+    }
+  ]
+}
