@@ -691,6 +691,211 @@ function showAIAnalysisButton(analysisId, summary) {
 }
 
 // ---------------------------------------------------------------------------
+// AI Learning Dashboard (Phase 1)
+// Muestra métricas en tiempo real consumiendo GET /ai/stats
+// Panel flotante independiente, toggle con botón 📊
+// ---------------------------------------------------------------------------
+
+let dashboardVisible = false;
+let dashboardPanel = null;
+let dashboardRefreshTimer = null;
+
+async function fetchAIStats() {
+  try {
+    const resp = await fetch(`${CONFIG.AI_BACKEND_URL}/ai/stats`);
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+function buildTrendSparkline(trend) {
+  // Render a minimal ASCII-style sparkline from accuracy_trend data
+  if (!trend || trend.length < 2) return "";
+  const values = trend.map((t) => t.accuracy_pct || 0);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const blocks = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+  return values
+    .slice(-12) // last 12 data points
+    .map((v) => blocks[Math.round(((v - min) / range) * (blocks.length - 1))])
+    .join("");
+}
+
+function renderDashboard(stats) {
+  if (!dashboardPanel) return;
+
+  const total     = stats.total_analyses     || 0;
+  const confirmed = stats.confirmed_analyses || 0;
+  const rejected  = stats.rejected_analyses  || 0;
+  const corrections = stats.total_corrections || 0;
+  const patterns  = stats.learned_patterns   || 0;
+  const accPct    = stats.accuracy_pct != null ? stats.accuracy_pct : (stats.accuracy_rate != null ? (stats.accuracy_rate * 100).toFixed(1) : "—");
+  const approvedPct = total > 0 ? ((confirmed / total) * 100).toFixed(1) : "0.0";
+  const rejectedPct = total > 0 ? ((rejected  / total) * 100).toFixed(1) : "0.0";
+
+  const trend   = stats.accuracy_trend    || [];
+  const topErr  = stats.top_error_fields  || [];
+  const active  = stats.active_patterns   || [];
+  const sparkline = buildTrendSparkline(trend);
+
+  // Calculate historic baseline vs current (first vs last snapshot)
+  let trendArrow = "";
+  if (trend.length >= 2) {
+    const first = trend[0].accuracy_pct || 0;
+    const last  = trend[trend.length - 1].accuracy_pct || 0;
+    const delta = (last - first).toFixed(1);
+    trendArrow = delta >= 0
+      ? `<span style="color:#4caf50">➔ +${delta}%</span>`
+      : `<span style="color:#f44336">➔ ${delta}%</span>`;
+  }
+
+  dashboardPanel.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+      <span style="font-weight:bold;font-size:12px;color:#fff;">📊 AI Learning Dashboard</span>
+      <button id="ai-dashboard-close" style="background:none;border:none;color:#aaa;cursor:pointer;font-size:14px;padding:0 2px;line-height:1;">✕</button>
+    </div>
+
+    <div style="border-bottom:1px solid rgba(255,255,255,0.15);padding-bottom:6px;margin-bottom:6px;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px 12px;font-size:10px;color:#ccc;">
+        <span>Total análisis:</span>   <span style="color:#fff;font-weight:bold;">${total}</span>
+        <span>Aprobados:</span>        <span style="color:#4caf50;">${confirmed} (${approvedPct}%)</span>
+        <span>Rechazados:</span>       <span style="color:#f44336;">${rejected} (${rejectedPct}%)</span>
+        <span>Correcciones:</span>     <span style="color:#ff9800;">${corrections}</span>
+        <span>Patrones activos:</span> <span style="color:#2196f3;">${patterns}</span>
+        <span>Precisión actual:</span> <span style="color:#fff;font-weight:bold;">${accPct}% ${trendArrow}</span>
+      </div>
+    </div>
+
+    ${sparkline ? `
+    <div style="margin-bottom:6px;">
+      <div style="font-size:9px;color:#888;margin-bottom:2px;">TENDENCIA DE PRECISIÓN</div>
+      <div style="font-size:13px;letter-spacing:1px;color:#4caf50;font-family:monospace;">${sparkline}</div>
+    </div>` : ""}
+
+    ${topErr.length > 0 ? `
+    <div style="border-bottom:1px solid rgba(255,255,255,0.15);padding-bottom:6px;margin-bottom:6px;">
+      <div style="font-size:9px;color:#888;margin-bottom:3px;">TOP CAMPOS CON ERRORES</div>
+      ${topErr.map((f, i) => `
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:#ccc;margin:1px 0;">
+          <span>${i + 1}. ${f.field_name}</span>
+          <span style="color:#ff9800;">${f.error_count} err (${f.error_rate_pct}%)</span>
+        </div>`).join("")}
+    </div>` : ""}
+
+    ${active.length > 0 ? `
+    <div>
+      <div style="font-size:9px;color:#888;margin-bottom:3px;">PATRONES INYECTADOS ACTIVOS</div>
+      ${active.slice(0, 5).map((p) => `
+        <div style="font-size:9px;color:#ccc;margin:2px 0;line-height:1.3;">
+          <span style="color:#2196f3;">●</span> ${p.description || p.pattern_type}
+          <span style="color:#888;margin-left:4px;">[${(p.confidence * 100).toFixed(0)}%]</span>
+        </div>`).join("")}
+    </div>` : `
+    <div style="font-size:9px;color:#666;font-style:italic;">Sin patrones activos aún. Envía correcciones para generar patrones.</div>`}
+
+    <div style="margin-top:6px;padding-top:4px;border-top:1px solid rgba(255,255,255,0.1);display:flex;justify-content:flex-end;">
+      <button id="ai-dashboard-refresh" style="background:rgba(33,150,243,0.2);border:1px solid rgba(33,150,243,0.4);color:#2196f3;cursor:pointer;font-size:9px;padding:2px 8px;border-radius:3px;">↻ Actualizar</button>
+    </div>
+  `;
+
+  // Wire up close button
+  const closeBtn = dashboardPanel.querySelector("#ai-dashboard-close");
+  if (closeBtn) closeBtn.onclick = toggleDashboard;
+
+  // Wire up refresh button
+  const refreshBtn = dashboardPanel.querySelector("#ai-dashboard-refresh");
+  if (refreshBtn) refreshBtn.onclick = () => loadAndRenderDashboard();
+}
+
+async function loadAndRenderDashboard() {
+  if (!dashboardPanel) return;
+
+  // Show loading state
+  const refreshBtn = dashboardPanel.querySelector("#ai-dashboard-refresh");
+  if (refreshBtn) { refreshBtn.textContent = "↻ Cargando…"; refreshBtn.disabled = true; }
+
+  const stats = await fetchAIStats();
+  if (!stats) {
+    dashboardPanel.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <span style="font-weight:bold;font-size:12px;color:#fff;">📊 AI Learning Dashboard</span>
+        <button id="ai-dashboard-close" style="background:none;border:none;color:#aaa;cursor:pointer;font-size:14px;padding:0 2px;">✕</button>
+      </div>
+      <div style="font-size:10px;color:#f44336;">Backend AI no disponible (puerto 8001)</div>`;
+    const closeBtn = dashboardPanel.querySelector("#ai-dashboard-close");
+    if (closeBtn) closeBtn.onclick = toggleDashboard;
+    return;
+  }
+
+  renderDashboard(stats);
+}
+
+function createDashboardPanel() {
+  const panel = document.createElement("div");
+  panel.id = "ai-learning-dashboard";
+  panel.style.cssText =
+    "position:fixed;bottom:12px;right:12px;z-index:999998;" +
+    "background:rgba(15,15,20,0.97);color:#fff;padding:12px 14px;border-radius:8px;" +
+    "font:11px/1.5 monospace;width:280px;" +
+    "box-shadow:0 4px 20px rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.1);";
+  panel.innerHTML = `<div style="font-size:10px;color:#888;">Cargando métricas…</div>`;
+  document.body.appendChild(panel);
+  return panel;
+}
+
+function createDashboardToggleBtn() {
+  // Remove existing button if any
+  document.querySelectorAll("#ai-dashboard-toggle-btn").forEach((el) => el.remove());
+
+  const btn = document.createElement("button");
+  btn.id = "ai-dashboard-toggle-btn";
+  btn.title = "AI Learning Dashboard";
+  btn.style.cssText =
+    "position:fixed;bottom:12px;right:12px;z-index:999997;" +
+    "background:rgba(33,150,243,0.9);color:#fff;border:none;" +
+    "width:36px;height:36px;border-radius:50%;cursor:pointer;" +
+    "font-size:16px;display:flex;align-items:center;justify-content:center;" +
+    "box-shadow:0 2px 8px rgba(0,0,0,0.4);transition:background 0.2s;";
+  btn.textContent = "📊";
+  btn.onclick = toggleDashboard;
+  document.body.appendChild(btn);
+  return btn;
+}
+
+function toggleDashboard() {
+  dashboardVisible = !dashboardVisible;
+
+  const toggleBtn = document.getElementById("ai-dashboard-toggle-btn");
+
+  if (dashboardVisible) {
+    // Hide the toggle button while panel is open
+    if (toggleBtn) toggleBtn.style.display = "none";
+
+    // Remove stale panel
+    document.querySelectorAll("#ai-learning-dashboard").forEach((el) => el.remove());
+    dashboardPanel = createDashboardPanel();
+    loadAndRenderDashboard();
+
+    // Auto-refresh every 30 seconds while open
+    clearInterval(dashboardRefreshTimer);
+    dashboardRefreshTimer = setInterval(loadAndRenderDashboard, 30_000);
+  } else {
+    clearInterval(dashboardRefreshTimer);
+    document.querySelectorAll("#ai-learning-dashboard").forEach((el) => el.remove());
+    dashboardPanel = null;
+    if (toggleBtn) toggleBtn.style.display = "flex";
+  }
+}
+
+// Initialize toggle button after DOM is ready (called from start())
+function initDashboardButton() {
+  createDashboardToggleBtn();
+}
+
+// ---------------------------------------------------------------------------
 // Orquestación: verificar cuando la página cargue imágenes, con debounce
 // ---------------------------------------------------------------------------
 
@@ -720,6 +925,7 @@ const observer = new MutationObserver((mutations) => {
 function start() {
   scheduleVerify();
   observer.observe(document.body, { childList: true, subtree: true });
+  initDashboardButton();
 }
 
 if (document.readyState === "loading") {

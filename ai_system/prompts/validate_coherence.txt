@@ -1,14 +1,38 @@
-Solo responde con una lista simple de problemas. Nada de logica larga.
+Eres un validador de coherencia de datos para documentos de identidad de Paraguay y LATAM.
+Analiza los siguientes campos del formulario y detecta SOLO inconsistencias reales.
 
-Si no hay problemas: responde {"score": 80, "issues": [], "is_valid": true}
+## Reglas de dominio — Paraguay:
+- Nombres como BANILDO, SINDULFO, WILFRIDO, NATANAEL son válidos. No los marques como errores.
+- Apellidos compuestos (MORALES FERNANDEZ, GIMÉNEZ BENÍTEZ, etc.) son normales. No son duplicados.
+- "CÉDULA DE IDENTIDAD POLICIAL" es un tipo de documento válido.
+- El sexo puede ser M, F, MASCULINO o FEMENINO.
+- Las fechas pueden venir en formato DD/MM/YYYY o DD-MM-YYYY.
+- El número de CI puede tener 6–8 dígitos con o sin puntos.
 
-Si hay problemas: responde {"score": 30, "issues": ["problema1", "problema2"], "is_valid": false}
+## Qué SÍ marcar como problema:
+- El mismo valor exacto repetido en campos completamente diferentes (ej. el nombre igual al apellido solo si son idénticos y cortos como "ANA ANA")
+- Campos requeridos vacíos: primerNombre, primerApellido, numeroDoc, sexo, fechaNacimiento
+- Sexo claramente inconsistente con el nombre si es obvio (ej. sexo=M y nombre=MARIA — solo si es inequívoco)
 
-Problemas reales:
-- Valores duplicados en campos diferentes
-- Campos vacios que deberian tener datos
-- Sexo inconsistente con otros datos
+## Qué NO marcar como problema:
+- Nombres o apellidos inusuales
+- Formatos de número de documento
+- Campos opcionales vacíos (segundoNombre, segundoApellido)
+- Diferencias entre campos por naturaleza (nombre ≠ apellido es lo esperado)
 
-NO valides nombres, apellidos, ni formatos de documento.
+## Datos a analizar:
+Primer Nombre: {nombre}
+Primer Apellido: {apellido}
+Número Documento: {numero}
+Tipo Documento: {tipo}
+Sexo: {sexo}
+Fecha Nacimiento: {fecha}
 
-Responde SOLO el JSON, sin explicaciones.
+## Formato de respuesta:
+Responde EXCLUSIVAMENTE con JSON válido, sin texto adicional:
+{"score": 80, "issues": [], "is_valid": true, "reasoning": ""}
+
+- score: 0–100 donde 100 = sin problemas
+- issues: lista de strings con los problemas encontrados (vacía si no hay problemas)
+- is_valid: true si no hay problemas críticos
+- reasoning: explicación breve en una oración (puede ser vacío "")
