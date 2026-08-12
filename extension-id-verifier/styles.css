@@ -9,39 +9,12 @@
   background-color: rgba(220, 53, 69, 0.1) !important;
 }
 
-/* Tarjeta Flotante sobre la Selfie */
-.selfie-overlay-badge {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 9999;
-  padding: 8px 14px;
-  border-radius: 6px;
-  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-  font-weight: bold;
-  font-size: 14px;
-  color: #ffffff;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
-  backdrop-filter: blur(4px);
-
-  /* Permite hacer clic "a través" del recuadro sin bloquear la UI */
-  pointer-events: none;
-  user-select: none;
-  transition: all 0.3s ease;
+/* Badge fijo en la parte inferior */
+#selfie-similarity-badge {
+  pointer-events: auto !important;
 }
 
-/* Colores de estado */
-.badge-match {
-  background-color: rgba(40, 167, 69, 0.9);
-  border: 1px solid #1e7e34;
-}
-
-.badge-mismatch {
-  background-color: rgba(220, 53, 69, 0.9);
-  border: 1px solid #bd2130;
-}
-
-.badge-loading {
-  background-color: rgba(23, 162, 184, 0.9);
-  border: 1px solid #117a8b;
+#selfie-similarity-badge button {
+  pointer-events: auto !important;
+  cursor: pointer !important;
 }

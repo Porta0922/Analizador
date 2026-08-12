@@ -1,0 +1,14 @@
+Solo responde con una lista simple de problemas. Nada de logica larga.
+
+Si no hay problemas: responde {"score": 80, "issues": [], "is_valid": true}
+
+Si hay problemas: responde {"score": 30, "issues": ["problema1", "problema2"], "is_valid": false}
+
+Problemas reales:
+- Valores duplicados en campos diferentes
+- Campos vacios que deberian tener datos
+- Sexo inconsistente con otros datos
+
+NO valides nombres, apellidos, ni formatos de documento.
+
+Responde SOLO el JSON, sin explicaciones.

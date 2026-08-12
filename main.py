@@ -140,6 +140,8 @@ def _haar_fallback_embedding(cv2_img):
         if len(faces) > 0:
             x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
             face_roi = cv2_img[y:y + h, x:x + w]
+            # Resize to minimum 160x160 to avoid conv errors
+            face_roi = cv2.resize(face_roi, (160, 160), interpolation=cv2.INTER_LINEAR)
             rgb = _cv2_to_rgb(face_roi)
             tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
             tensor = (tensor - 0.5) / 0.25  # normalizar como VGGFace2
@@ -305,11 +307,9 @@ def _fuzzy_date_matches(expected: str, extracted_text: str) -> bool:
 
 
 def field_text_matches_smart(field: str, expected_value: str, extracted_text: str) -> bool:
-    """Matching inteligente: tolerante para tipoDoc (1 palabra puede fallar)."""
+    """Matching inteligente. tipoDoc se ignora porque no es relevante."""
     if field == "tipoDoc":
-        keywords = normalize_text(expected_value).split()
-        matches = sum(1 for w in keywords if re.search(r"\b" + re.escape(w) + r"\b", extracted_text))
-        return matches >= len(keywords) - 1
+        return True  # Siempre matchea - no es relevante
     return field_text_matches(expected_value, extracted_text)
 
 

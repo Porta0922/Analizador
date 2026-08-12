@@ -1,6 +1,7 @@
 // Configuración: ajustar URL del backend según despliegue
 const CONFIG = {
   BACKEND_URL: "http://localhost:8000",
+  AI_BACKEND_URL: "http://localhost:8001",
   // Palabras que ayudan a identificar los inputs de archivo (selfie vs documento)
   SELFIE_HINTS: ["selfie", "rostro", "retrato"],
   ID_HINTS: ["id", "documento", "dni", "carnet", "cedula", "identificacion"],
@@ -73,7 +74,7 @@ async function collectImages() {
     if (b64) {
       missing[slot].b64 = b64;
       missing[slot].img = null;
-      console.info(`[id-verifier] ${slot} desde input de archivo:`, input.name || input.id);
+      console.info("[id-verifier] desde input de archivo:", input.name || input.id);
     }
   };
   await setFromInput("selfie", selfieInput);
@@ -96,7 +97,7 @@ async function collectImages() {
       if (b64) {
         missing[slot].b64 = b64;
         missing[slot].img = img;
-        console.info(`[id-verifier] ${slot} desde <img> (preview):`, img.src);
+        console.info("[id-verifier] desde <img> (preview):", img.src);
         break;
       }
     }
@@ -112,7 +113,7 @@ async function collectImages() {
       if (b64) {
         missing[slot].b64 = b64;
         missing[slot].img = img;
-        console.info(`[id-verifier] ${slot} desde <img> (fallback):`, img.src);
+        console.info("[id-verifier] desde <img> (fallback):", img.src);
         break;
       }
     }
@@ -136,9 +137,9 @@ async function imgToBase64(img) {
       const blob = await resp.blob();
       return await fileToBase64(blob);
     }
-    console.warn(`[id-verifier] fetch ${img.src} -> HTTP ${resp.status}`);
+    console.warn("[id-verifier] fetch -> HTTP", resp.status);
   } catch (err) {
-    console.warn(`[id-verifier] fetch falló para ${img.src}:`, err.message);
+    console.warn("[id-verifier] fetch falló para:", img.src, err.message);
   }
 
   // 2) fallback con <canvas> (válido para blob:/mismo origen; falla si CORS)
@@ -152,7 +153,7 @@ async function imgToBase64(img) {
     canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
     return canvas.toDataURL("image/jpeg", 0.85);
   } catch (err) {
-    console.warn(`[id-verifier] canvas falló para ${img.src}:`, err.message);
+    console.warn("[id-verifier] canvas falló para:", img.src, err.message);
     return null;
   }
 }
@@ -163,7 +164,7 @@ function collectFormData() {
     const input = findInputByFieldKey(key);
     const value = input && (input.value || "").trim() ? input.value.trim() : "";
     formData[key] = value;
-    console.info(`[id-verifier] campo '${key}' -> input:`, input ? `${input.tagName}[name=${input.name},id=${input.id}]` : "NO ENCONTRADO", `valor: "${value}"`);
+    console.info("[id-verifier] campo '" + key + "' -> input:", input ? input.tagName + "[name=" + input.name + ",id=" + input.id + "]" : "NO ENCONTRADO", "valor:", value);
   }
   return formData;
 }
@@ -259,6 +260,16 @@ async function verify() {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || `Error del servidor (${resp.status})`);
     renderResults(data);
+
+    // Call AI backend for additional analysis (once only)
+    if (!document.getElementById("ai-analysis-section")) {
+      analyzeWithAI(selfie, id, idBack, formData).then((aiResult) => {
+        if (aiResult && aiResult.result && !document.getElementById("ai-analysis-section")) {
+          renderAIResults(aiResult);
+        }
+      }).catch(() => {});
+    }
+
   } catch (err) {
     showError(`Verificación falló: ${err.message}`);
   }
@@ -276,7 +287,6 @@ function highlightSelection(selfieImg, idImg, idBackImg) {
   if (selfieImg) drawDebugBox(selfieImg, "selfie-debug-box", "#2196f3", "SELFIE");
   if (idImg) drawDebugBox(idImg, "id-debug-box", "#ff9800", "DOCUMENTO");
   if (idBackImg) drawDebugBox(idBackImg, "idback-debug-box", "#9c27b0", "DORSO");
-  drawDebugLegend(selfieImg, idImg, idBackImg, null, false);
 }
 
 function drawDebugBox(img, boxClass, color, label) {
@@ -299,33 +309,8 @@ function drawDebugBox(img, boxClass, color, label) {
   parent.appendChild(box);
 }
 
-function drawDebugLegend(selfieImg, idImg, idBackImg, docDupSim, isDocDup) {
-  const existing = document.getElementById("id-verifier-legend");
-  if (existing) existing.remove();
-
-  const legend = document.createElement("div");
-  legend.id = "id-verifier-legend";
-  legend.style.cssText =
-    "position:fixed;bottom:12px;right:12px;z-index:999999;background:rgba(0,0,0,0.85);" +
-    "color:#fff;font:12px/20px monospace;padding:8px 12px;border-radius:6px;";
-  legend.innerHTML =
-    `<div><span style="display:inline-block;width:10px;height:10px;background:#2196f3;margin-right:6px;"></span>` +
-    `Selfie (${selfieImg ? "SI" : "no encontrada"})</div>` +
-    `<div><span style="display:inline-block;width:10px;height:10px;background:#ff9800;margin-right:6px;"></span>` +
-    `Documento (${idImg ? "SI" : "no encontrado"})</div>` +
-    `<div><span style="display:inline-block;width:10px;height:10px;background:#9c27b0;margin-right:6px;"></span>` +
-    `Dorso (${idBackImg ? "SI" : "no encontrado"})</div>` +
-    (docDupSim !== null
-      ? `<div style="color:${isDocDup ? "#f44336" : "#4caf50"};">` +
-        `Documentos: ${docDupSim}%${isDocDup ? " (DUPLICADOS)" : ""}</div>`
-      : "");
-  document.body.appendChild(legend);
-}
-
 function clearHighlight() {
   document.querySelectorAll(".selfie-debug-box, .id-debug-box, .idback-debug-box").forEach((el) => el.remove());
-  const legend = document.getElementById("id-verifier-legend");
-  if (legend) legend.remove();
 }
 
 function renderResults(res) {
@@ -340,25 +325,45 @@ function renderResults(res) {
       ? ` (rostro detectado solo en ${res.face_detected === "none" ? "ninguna" : res.face_detected})`
       : "";
 
-  if (selfieImg) {
-    const parent = selfieImg.offsetParent || selfieImg.parentElement;
-    if (parent) {
-      parent.style.position = "relative";
-      const badge = document.createElement("div");
-      badge.id = "selfie-similarity-badge";
-      badge.className = `selfie-overlay-badge ${res.is_same_person ? "badge-match" : "badge-mismatch"}`;
-      let text = `Similitud: ${res.facial_similarity}%${warning}`;
-      if (res.is_document_duplicate) {
-        text += ` | DOC DUPLICADOS: ${res.document_duplicate_similarity}%`;
-      }
-      badge.textContent = text;
-      parent.appendChild(badge);
-    }
+  // Create fixed badge at bottom of screen
+  const badge = document.createElement("div");
+  badge.id = "selfie-similarity-badge";
+  badge.style.cssText =
+    "position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:999999;" +
+    "background:rgba(0,0,0,0.9);color:#fff;padding:12px 16px;border-radius:8px;" +
+    "font:13px/20px monospace;min-width:320px;box-shadow:0 4px 12px rgba(0,0,0,0.4);";
+
+  // Header with status
+  const header = document.createElement("div");
+  header.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:8px;";
+  const statusDot = document.createElement("span");
+  statusDot.style.cssText = `width:10px;height:10px;border-radius:50%;background:${res.is_same_person ? "#4caf50" : "#f44336"};flex-shrink:0;`;
+  const headerText = document.createElement("span");
+  headerText.style.cssText = "font-weight:bold;font-size:14px;";
+  headerText.textContent = `Similitud: ${res.facial_similarity}%${warning}`;
+  header.appendChild(statusDot);
+  header.appendChild(headerText);
+  badge.appendChild(header);
+
+  // Document duplicate info
+  if (res.is_document_duplicate) {
+    const dupInfo = document.createElement("div");
+    dupInfo.style.cssText = "color:#ff9800;font-size:11px;margin-bottom:4px;";
+    dupInfo.textContent = `DOC DUPLICADOS: ${res.document_duplicate_similarity}%`;
+    badge.appendChild(dupInfo);
   }
 
-  // Dibujar leyenda actualizada con estado de duplicados
-  drawDebugLegend(selfieImg, idImg, idBackImg, res.document_duplicate_similarity, res.is_document_duplicate);
+  // Field matches summary
+  const fieldSummary = document.createElement("div");
+  fieldSummary.style.cssText = "font-size:11px;color:#aaa;border-top:1px solid rgba(255,255,255,0.2);padding-top:6px;margin-top:4px;";
+  const matches = Object.entries(res.field_matches || {});
+  const matchCount = matches.filter(([, v]) => v).length;
+  fieldSummary.textContent = `Campos: ${matchCount}/${matches.length} coinciden`;
+  badge.appendChild(fieldSummary);
 
+  document.body.appendChild(badge);
+
+  // Highlight inputs
   for (const [key, isMatch] of Object.entries(res.field_matches || {})) {
     const input = findInputByFieldKey(key);
     if (input) {
@@ -368,32 +373,207 @@ function renderResults(res) {
   }
 }
 
+function renderAIResults(aiResult) {
+  const badge = document.getElementById("selfie-similarity-badge");
+  if (!badge || !aiResult || !aiResult.result) return;
+
+  const result = aiResult.result;
+  const shouldReject = aiResult.should_reject;
+
+  // Create AI section
+  const aiDiv = document.createElement("div");
+  aiDiv.id = "ai-analysis-section";
+  aiDiv.style.cssText = "margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.3);";
+
+  // AI Header
+  const header = document.createElement("div");
+  header.style.cssText = "font-weight: bold; margin-bottom: 4px; color: " + (shouldReject ? "#f44336" : "#4caf50") + ";";
+  header.textContent = shouldReject ? "IA: RECHAZADO" : "IA: APROBADO";
+  aiDiv.appendChild(header);
+
+  // Scores
+  const scores = document.createElement("div");
+  scores.style.cssText = "font-size: 10px; color: #ccc;";
+  scores.innerHTML =
+    `Coherencia: ${result.coherence_score}% | Integridad: ${result.tampering_score}% | Confianza: ${result.overall_confidence}%`;
+  aiDiv.appendChild(scores);
+
+  // Issues if any
+  if (result.coherence_issues && result.coherence_issues.length > 0) {
+    const issues = document.createElement("div");
+    issues.style.cssText = "font-size: 10px; color: #ff9800; margin-top: 4px;";
+    const issueList = result.coherence_issues.map(i => typeof i === "object" ? (i.reason || i.message || JSON.stringify(i)) : i);
+    issues.textContent = "Problemas: " + issueList.join(", ");
+    aiDiv.appendChild(issues);
+  }
+
+  // Tampering areas if any
+  if (result.tampering_areas && result.tampering_areas.length > 0) {
+    const areas = document.createElement("div");
+    areas.style.cssText = "font-size: 10px; color: #ff9800; margin-top: 2px;";
+    const areaList = result.tampering_areas.map(a => typeof a === "object" ? (a.area || a.reason || JSON.stringify(a)) : a);
+    areas.textContent = "Áreas sospechosas: " + areaList.join(", ");
+    aiDiv.appendChild(areas);
+  }
+
+  // Feedback buttons
+  const btnContainer = document.createElement("div");
+  btnContainer.style.cssText = "display: flex; gap: 4px; margin-top: 6px;";
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.textContent = "✓ IA Correcta";
+  confirmBtn.style.cssText =
+    "background: #28a745; color: white; border: none; padding: 3px 6px; " +
+    "border-radius: 3px; cursor: pointer; font-size: 10px; flex: 1;";
+  confirmBtn.onclick = async () => {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = "Enviando...";
+    await submitAIFeedback(aiResult.analysis_id, true);
+    showThankYou(badge, "Feedback enviado. Gracias!");
+  };
+
+  const rejectBtn = document.createElement("button");
+  rejectBtn.textContent = "✗ IA Incorrecta";
+  rejectBtn.style.cssText =
+    "background: #dc3545; color: white; border: none; padding: 3px 6px; " +
+    "border-radius: 3px; cursor: pointer; font-size: 10px; flex: 1;";
+  rejectBtn.onclick = () => {
+    showCorrectionForm(badge, aiResult);
+  };
+
+  btnContainer.appendChild(confirmBtn);
+  btnContainer.appendChild(rejectBtn);
+  aiDiv.appendChild(btnContainer);
+
+  badge.appendChild(aiDiv);
+}
+
+function showCorrectionForm(badge, aiResult) {
+  // Remove buttons
+  const btnContainer = badge.querySelector("div:last-child");
+  if (btnContainer) btnContainer.remove();
+
+  const formDiv = document.createElement("div");
+  formDiv.style.cssText = "margin-top: 8px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 8px;";
+
+  const title = document.createElement("div");
+  title.style.cssText = "font-size: 11px; color: #ff9800; margin-bottom: 6px;";
+  title.textContent = "¿Qué está mal? Seleccioná los problemas:";
+  formDiv.appendChild(title);
+
+  const issues = [
+    { id: "wrong_similarity", label: "Similitud facial incorrecta" },
+    { id: "wrong_coherence", label: "Coherencia de datos incorrecta" },
+    { id: "wrong_tampering", label: "Detección de fraude incorrecta" },
+    { id: "wrong_fields", label: "Campos coincidentes incorrectos" },
+  ];
+
+  const checkboxes = [];
+  issues.forEach((issue) => {
+    const label = document.createElement("label");
+    label.style.cssText = "display: flex; align-items: center; gap: 4px; font-size: 10px; color: #ccc; margin: 3px 0; cursor: pointer;";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = issue.id;
+    checkbox.style.cssText = "cursor: pointer;";
+    checkboxes.push(checkbox);
+
+    const span = document.createElement("span");
+    span.textContent = issue.label;
+
+    label.appendChild(checkbox);
+    label.appendChild(span);
+    formDiv.appendChild(label);
+  });
+
+  // Additional notes
+  const notesLabel = document.createElement("div");
+  notesLabel.style.cssText = "font-size: 10px; color: #aaa; margin-top: 6px; margin-bottom: 2px;";
+  notesLabel.textContent = "Notas adicionales (opcional):";
+  formDiv.appendChild(notesLabel);
+
+  const notesInput = document.createElement("textarea");
+  notesInput.style.cssText =
+    "width: 100%; height: 40px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.3); " +
+    "color: white; border-radius: 3px; padding: 4px; font-size: 10px; resize: none; box-sizing: border-box;";
+  notesInput.placeholder = "Ej: El nombre real es Juan, no José...";
+  formDiv.appendChild(notesInput);
+
+  // Submit button
+  const submitBtn = document.createElement("button");
+  submitBtn.textContent = "Enviar Corrección";
+  submitBtn.style.cssText =
+    "background: #ff9800; color: black; border: none; padding: 5px 10px; " +
+    "border-radius: 3px; cursor: pointer; font-size: 10px; width: 100%; margin-top: 8px; font-weight: bold;";
+  submitBtn.onclick = async () => {
+    const selectedIssues = checkboxes.filter((cb) => cb.checked).map((cb) => cb.value);
+    const notes = notesInput.value.trim();
+
+    if (selectedIssues.length === 0 && !notes) {
+      alert("Seleccioná al menos un problema o escribí una nota.");
+      return;
+    }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Enviando...";
+
+    const corrections = selectedIssues.map((issue) => ({
+      field_name: issue,
+      expected_value: notes || issue,
+      extracted_value: "",
+      was_correct: false,
+    }));
+
+    await submitAIFeedback(aiResult.analysis_id, false, corrections);
+    showThankYou(badge, "Corrección enviada. ¡Gracias!");
+  };
+  formDiv.appendChild(submitBtn);
+
+  badge.appendChild(formDiv);
+}
+
+function showThankYou(badge, message) {
+  badge.innerHTML = "";
+  badge.style.cssText =
+    "position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:999999;" +
+    "background:rgba(40,167,69,0.95);color:#fff;padding:12px 16px;border-radius:8px;" +
+    "font:13px/20px monospace;min-width:200px;text-align:center;";
+
+  const thankYou = document.createElement("div");
+  thankYou.textContent = message;
+  badge.appendChild(thankYou);
+
+  // Auto-hide after 3 seconds
+  setTimeout(() => {
+    badge.style.opacity = "0";
+    badge.style.transition = "opacity 0.5s";
+    setTimeout(() => badge.remove(), 500);
+  }, 3000);
+}
+
 function showLoading() {
   clearFeedback();
-  const img = currentSelfieImg();
-  if (!img) return;
-  const parent = img.offsetParent || img.parentElement;
-  if (!parent) return;
-  parent.style.position = "relative";
   const badge = document.createElement("div");
   badge.id = "selfie-similarity-badge";
-  badge.className = "selfie-overlay-badge badge-loading";
+  badge.style.cssText =
+    "position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:999999;" +
+    "background:rgba(0,0,0,0.9);color:#fff;padding:12px 16px;border-radius:8px;" +
+    "font:13px/20px monospace;min-width:200px;text-align:center;";
   badge.textContent = "Verificando...";
-  parent.appendChild(badge);
+  document.body.appendChild(badge);
 }
 
 function showError(message) {
   clearFeedback();
-  const img = currentSelfieImg();
-  if (!img) return;
-  const parent = img.offsetParent || img.parentElement;
-  if (!parent) return;
-  parent.style.position = "relative";
   const badge = document.createElement("div");
   badge.id = "selfie-similarity-badge";
-  badge.className = "selfie-overlay-badge badge-mismatch";
+  badge.style.cssText =
+    "position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:999999;" +
+    "background:rgba(220,53,69,0.95);color:#fff;padding:12px 16px;border-radius:8px;" +
+    "font:13px/20px monospace;min-width:200px;text-align:center;";
   badge.textContent = message;
-  parent.appendChild(badge);
+  document.body.appendChild(badge);
 }
 
 function clearFeedback() {
@@ -407,6 +587,107 @@ function currentSelfieImg() {
   if (debugSelection.selfieImg && debugSelection.selfieImg.isConnected) return debugSelection.selfieImg;
   const images = Array.from(document.querySelectorAll("img")).filter((i) => i.src);
   return images.find((i) => i.src.startsWith("blob:") || i.src.startsWith("data:")) || images[0];
+}
+
+// ---------------------------------------------------------------------------
+// AI Analysis Functions
+// ---------------------------------------------------------------------------
+
+async function analyzeWithAI(selfieB64, idFrontB64, idBackB64, formData) {
+  try {
+    const resp = await fetch(`${CONFIG.AI_BACKEND_URL}/ai/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        selfie_b64: selfieB64,
+        doc_front_b64: idFrontB64,
+        doc_back_b64: idBackB64 || null,
+        form_data: formData,
+      }),
+    });
+
+    if (!resp.ok) {
+      console.warn("[id-verifier] AI analysis failed:", resp.status);
+      return null;
+    }
+
+    return await resp.json();
+  } catch (err) {
+    console.warn("[id-verifier] AI analysis error:", err.message);
+    return null;
+  }
+}
+
+async function submitAIFeedback(analysisId, confirmed, corrections = []) {
+  try {
+    const resp = await fetch(`${CONFIG.AI_BACKEND_URL}/ai/feedback/${analysisId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirmed: confirmed,
+        corrections: corrections,
+      }),
+    });
+
+    if (!resp.ok) {
+      console.warn("[id-verifier] AI feedback failed:", resp.status);
+      return null;
+    }
+
+    return await resp.json();
+  } catch (err) {
+    console.warn("[id-verifier] AI feedback error:", err.message);
+    return null;
+  }
+}
+
+function showAIAnalysisButton(analysisId, summary) {
+  const badge = document.getElementById("selfie-similarity-badge");
+  if (!badge) return;
+
+  const aiDiv = document.createElement("div");
+  aiDiv.id = "ai-analysis-controls";
+  aiDiv.style.cssText = "margin-top: 8px; border-top: 1px solid rgba(255,255,255,0.3); padding-top: 8px;";
+
+  const summaryText = document.createElement("div");
+  summaryText.style.cssText = "font-size: 10px; margin-bottom: 6px; color: #aaa;";
+  summaryText.textContent = summary || "Análisis IA disponible";
+  aiDiv.appendChild(summaryText);
+
+  const btnContainer = document.createElement("div");
+  btnContainer.style.cssText = "display: flex; gap: 4px;";
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.textContent = "✓ Correcto";
+  confirmBtn.style.cssText =
+    "background: #28a745; color: white; border: none; padding: 4px 8px; " +
+    "border-radius: 3px; cursor: pointer; font-size: 11px; flex: 1;";
+  confirmBtn.onclick = async () => {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = "Enviando...";
+    await submitAIFeedback(analysisId, true);
+    confirmBtn.textContent = "✓ Enviado";
+    confirmBtn.style.background = "#155724";
+  };
+
+  const rejectBtn = document.createElement("button");
+  rejectBtn.textContent = "✗ Rechazar";
+  rejectBtn.style.cssText =
+    "background: #dc3545; color: white; border: none; padding: 4px 8px; " +
+    "border-radius: 3px; cursor: pointer; font-size: 11px; flex: 1;";
+  rejectBtn.onclick = async () => {
+    rejectBtn.disabled = true;
+    rejectBtn.textContent = "Enviando...";
+    await submitAIFeedback(analysisId, false);
+    rejectBtn.textContent = "✗ Rechazado";
+    rejectBtn.style.background = "#721c24";
+  };
+
+  btnContainer.appendChild(confirmBtn);
+  btnContainer.appendChild(rejectBtn);
+  aiDiv.appendChild(btnContainer);
+
+  badge.appendChild(aiDiv);
 }
 
 // ---------------------------------------------------------------------------

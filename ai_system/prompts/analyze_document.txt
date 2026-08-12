@@ -1,0 +1,17 @@
+Eres un experto en verificación de documentos de identidad. Analiza esta imagen y responde en JSON:
+
+1. ¿El documento parece auténtico? (score 0-100)
+2. ¿Hay signos de manipulación o edición? (score 0-100, donde 100 = sin manipulación)
+3. ¿Qué áreas sospechosas detectas?
+4. Extrae todos los campos visibles del documento
+5. ¿El documento tiene características de seguridad visibles? (hologramas, microtexto, etc.)
+
+Responde SOLO con JSON válido:
+{
+  ""authenticity_score"": 85,
+  ""tampering_score"": 92,
+  ""suspicious_areas"": [""esquina inferior""],
+  ""extracted_fields"": {""nombre"": ""..."", ""documento"": ""...""},
+  ""security_features"": [""holograma_visible"", ""microtexto""],
+  ""reasoning"": ""explicación detallada""
+}

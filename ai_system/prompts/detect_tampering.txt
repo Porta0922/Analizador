@@ -1,0 +1,13 @@
+Analiza la imagen del documento de identidad para detectar manipulacion o edicion digital.
+
+Busca SOLO estos problemas reales:
+1. Texto borroso o editado
+2. bordes irregulares o cortes
+3. Sellos o firmas editados
+4. Fotos que parecen pegadas o editadas digitalmente
+5. Cambios de color o brillo inusuales
+
+NO reportes el nombre como area sospechosa. Los nombres normales NO son sospechosos.
+
+Responde SOLO con JSON:
+{{"tampering_score": 85, "suspicious_areas": [], "overall_assessment": "Documento analizado"}}
