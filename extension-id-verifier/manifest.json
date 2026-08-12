@@ -1,14 +1,30 @@
 {
   "manifest_version": 3,
   "name": "eCLUB - ID Auto Verifier",
-  "version": "1.4",
-  "permissions": ["activeTab", "scripting"],
+  "version": "1.5",
+  "description": "Verificación automática de identidad con IA para formularios eCLUB.",
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://localhost:8001/*",
+    "*://*/onboarding/solicitudes/*"
+  ],
   "content_scripts": [
     {
-      "matches": ["*://*/onboarding/solicitudes/*"],
-      "js": ["content.js"],
-      "css": ["styles.css"],
-      "all_frames": true
+      "matches": [
+        "*://*/onboarding/solicitudes/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
     }
   ]
 }
