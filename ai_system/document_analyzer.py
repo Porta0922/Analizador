@@ -96,12 +96,22 @@ class DocumentAnalyzer:
     # 3-layer system prompt builder (Phase 2c)
     # ------------------------------------------------------------------
 
+    # Prompts que son puramente visuales (comparan imágenes) — NO deben recibir
+    # reglas de dominio de texto ni patrones aprendidos de campos de formulario.
+    # Agregarles LOCALE_RULES confunde al modelo (llava devuelve esas reglas
+    # en su reasoning y corrompe el JSON de respuesta).
+    _VISUAL_ONLY_PROMPTS = {"verify_face_match", "verify_back_document"}
+
     def _build_system_prompt(self, base_prompt_key: str, form_data: Optional[dict] = None) -> str:
         """
         Build a layered system prompt:
           Layer 1 — Base prompt (from prompts/*.txt)
-          Layer 2 — Locale / domain rules (Paraguay specifics)
-          Layer 3 — Dynamic learned patterns injected from DB
+          Layer 2 — Locale / domain rules  [SOLO para prompts de texto]
+          Layer 3 — Dynamic learned patterns [SOLO para prompts de texto]
+
+        Los prompts visuales (verify_face_match, verify_back_document) usan
+        solo el Layer 1 para evitar contaminar la respuesta del modelo de visión
+        con reglas de texto que no son relevantes para la comparación facial.
         """
         # --- Layer 1: Base ---
         base = self.prompts.get(base_prompt_key, "")
@@ -117,9 +127,13 @@ class DocumentAnalyzer:
                     fecha=form_data.get("fechaNacimiento", ""),
                 )
             except KeyError:
-                pass  # Template may not have all placeholders
+                pass
 
-        # --- Layer 2: Locale rules ---
+        # Prompts visuales: devolver solo el base — sin reglas de dominio ni patrones
+        if base_prompt_key in self._VISUAL_ONLY_PROMPTS:
+            return base
+
+        # --- Layer 2: Locale rules (solo prompts de texto/documento) ---
         prompt = base + "\n\n" + LOCALE_RULES.strip()
 
         # --- Layer 3: Dynamic pattern injection ---

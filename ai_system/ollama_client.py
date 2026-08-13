@@ -11,63 +11,106 @@ class OllamaClient:
         self.client = httpx.Client(timeout=60.0)
     
     def _parse_json_response(self, response_text: str) -> Dict[str, Any]:
-        """Extract JSON from response text that might contain other content."""
+        """
+        Extrae el primer objeto JSON válido del texto de respuesta del modelo.
+
+        Estrategia (en orden):
+          1. Parse directo (modelo devolvió JSON limpio)
+          2. Extrae de bloque markdown ```json ... ```
+          3. Scanner de profundidad: encuentra el primer '{' y avanza hasta
+             encontrar el '}' de cierre que lo empareja — robusto a texto
+             antes/después del JSON, arrays anidados, y strings con llaves
+          4. Búsqueda de score numérico explícito como último recurso
+          5. Fallback con raw_response
+        """
         import re
-        
+
         if not response_text or not response_text.strip():
             return {"raw_response": "", "reasoning": "Empty response"}
-        
-        # Try direct JSON parse
+
+        text = response_text.strip()
+
+        # ── 1. Parse directo ─────────────────────────────────────────────────
         try:
-            result = json.loads(response_text)
+            result = json.loads(text)
             if isinstance(result, dict):
                 return result
-            return {"raw_response": response_text, "reasoning": response_text}
         except json.JSONDecodeError:
             pass
-        
-        # Try to extract JSON from markdown code blocks
-        code_block = re.search(r'```(?:json)?\s*\n?([\s\S]*?)\n?```', response_text)
+
+        # ── 2. Bloque markdown ```json``` ─────────────────────────────────────
+        code_block = re.search(r'```(?:json)?\s*\n?([\s\S]*?)\n?```', text)
         if code_block:
             try:
-                result = json.loads(code_block.group(1))
+                result = json.loads(code_block.group(1).strip())
                 if isinstance(result, dict):
                     return result
             except json.JSONDecodeError:
                 pass
-        
-        # Try to find JSON object in the response
-        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text)
-        if json_match:
-            try:
-                result = json.loads(json_match.group())
-                if isinstance(result, dict):
-                    return result
-            except json.JSONDecodeError:
-                # Try to fix common JSON issues
-                fixed = json_match.group().replace('""', '"').replace('\\n', '\n')
-                try:
-                    result = json.loads(fixed)
-                    if isinstance(result, dict):
-                        return result
-                except json.JSONDecodeError:
-                    pass
-        
-        # If response contains key terms, create a default structure
-        if any(term in response_text.lower() for term in ["score", "issue", "problem", "error"]):
-            # Try to extract score from text
-            score_match = re.search(r'(?:score|puntuacion|calificacion)[:\s]*(\d+)', response_text, re.IGNORECASE)
-            score = int(score_match.group(1)) if score_match else 50
-            
+
+        # ── 3. Scanner de profundidad (el más robusto) ────────────────────────
+        # Recorre el texto carácter a carácter llevando la cuenta de {, } y
+        # respetando strings (ignora llaves dentro de "...").
+        # Devuelve el primer objeto JSON completo que encuentre.
+        start = text.find('{')
+        if start != -1:
+            depth    = 0
+            in_str   = False
+            escape   = False
+            for i, ch in enumerate(text[start:], start):
+                if escape:
+                    escape = False
+                    continue
+                if ch == '\\' and in_str:
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            result = json.loads(candidate)
+                            if isinstance(result, dict):
+                                return result
+                        except json.JSONDecodeError:
+                            # Intentar reparaciones menores: comillas simples, trailing commas
+                            try:
+                                fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
+                                result = json.loads(fixed)
+                                if isinstance(result, dict):
+                                    return result
+                            except json.JSONDecodeError:
+                                pass
+                        break  # El primer objeto falló — no seguir buscando
+
+        # ── 4. Extracción de score numérico explícito ─────────────────────────
+        score_match = re.search(
+            r'(?:face_match_score|back_score|tampering_score|score)["\s:]*(\d+)',
+            text, re.IGNORECASE
+        )
+        if score_match:
+            score = min(100, max(0, int(score_match.group(1))))
+            # Extraer reasoning del texto libre si existe
+            reasoning_match = re.search(r'reasoning["\s:]*["\']([^"\']{10,200})', text, re.IGNORECASE)
+            reasoning = reasoning_match.group(1).strip() if reasoning_match else text[:200]
             return {
-                "score": score,
+                "score":           score,
+                "face_match_score": score,
                 "tampering_score": score,
-                "issues": [],
-                "reasoning": response_text[:500]
+                "back_score":      score,
+                "issues":          [],
+                "reasoning":       reasoning,
             }
-        
-        # Return raw text as reasoning if JSON extraction fails
-        return {"raw_response": response_text, "reasoning": response_text[:500]}
+
+        # ── 5. Fallback total ─────────────────────────────────────────────────
+        return {"raw_response": text[:500], "reasoning": text[:500]}
     
     def get_available_models(self) -> list:
         """Get list of available Ollama models."""

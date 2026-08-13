@@ -530,9 +530,16 @@ def detect_selfie_document_fraud(
 # OCR y matching de campos
 # ---------------------------------------------------------------------------
 def field_text_matches(expected_value: str, extracted_text: str) -> bool:
+    """
+    Verifica que TODAS las palabras del campo esperado aparezcan en el texto OCR.
+    Estrategias en orden:
+      1. Token por token con word-boundary
+      2. Compact match (sin espacios) — para números fragmentados por OCR
+    """
     words = normalize_text(expected_value).split()
     if not words:
         return False
+
     for word in words:
         if not re.search(r"\b" + re.escape(word) + r"\b", extracted_text):
             compact_expected = "".join(words)
@@ -542,22 +549,71 @@ def field_text_matches(expected_value: str, extracted_text: str) -> bool:
 
 
 def _fuzzy_date_matches(expected: str, extracted_text: str) -> bool:
-    m = re.search(r"(\d{1,2})\s+(\d{1,2})\s+(\d{4})", extracted_text)
-    if not m:
+    """
+    Matching tolerante a errores OCR en fechas.
+    Acepta separadores: espacios, guiones, barras, puntos.
+    Tolerancia: ±2 días, ±1 mes, 0 años.
+    """
+    # Normalizar separadores del valor esperado a extraer d/m/y
+    parts = re.findall(r"\d+", expected)
+    if len(parts) < 3:
         return False
-    ed, em, ey = re.findall(r"\d+", expected)
-    od, om, oy = m.groups()
-    try:
-        return (abs(int(ed) - int(od)) <= 2 and
-                abs(int(em) - int(om)) <= 1 and
-                abs(int(ey) - int(oy)) <= 1)
-    except ValueError:
-        return False
+    ed, em, ey = parts[0], parts[1], parts[2]
+
+    # Buscar patrón de fecha en el texto OCR (cualquier separador o sin separador)
+    # Formatos: DD/MM/YYYY, DD-MM-YYYY, DD MM YYYY, DDMMYYYY
+    patterns = [
+        r"(\d{1,2})[\s/\-\.](\d{1,2})[\s/\-\.](\d{4})",   # con separador
+        r"(\d{2})(\d{2})(\d{4})",                            # sin separador (DDMMYYYY)
+    ]
+    for pat in patterns:
+        m = re.search(pat, extracted_text)
+        if m:
+            od, om, oy = m.group(1), m.group(2), m.group(3)
+            try:
+                if (abs(int(ed) - int(od)) <= 2 and
+                        abs(int(em) - int(om)) <= 1 and
+                        int(ey) == int(oy)):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _normalize_date_for_match(value: str) -> str:
+    """Normaliza fechas a formato comparable: extrae solo los dígitos en orden."""
+    parts = re.findall(r"\d+", value)
+    return " ".join(parts) if parts else value
 
 
 def field_text_matches_smart(field: str, expected_value: str, extracted_text: str) -> bool:
-    if field == "tipoDoc":
+    """
+    Matching inteligente por tipo de campo.
+    - tipoDoc     → siempre True (campo no relevante para OCR)
+    - fechaNacimiento / fecha* / date* → fuzzy date match con tolerancia
+    - numeroDoc / numero* → compact match (ignora puntos, espacios, guiones)
+    - resto       → match estándar por tokens
+    """
+    field_lower = field.lower()
+
+    # Tipo de documento: no relevante para OCR
+    if field_lower == "tipodoc":
         return True
+
+    # Fechas: matching tolerante a formato y errores OCR
+    if "fecha" in field_lower or "date" in field_lower or "nacimiento" in field_lower:
+        return _fuzzy_date_matches(expected_value, extracted_text)
+
+    # Número de documento: ignorar separadores (puntos, guiones, espacios)
+    if "numero" in field_lower or "num" in field_lower or field_lower in ("doc", "documento"):
+        # Compact match: comparar solo dígitos
+        expected_digits = re.sub(r"\D", "", normalize_text(expected_value))
+        ocr_digits      = re.sub(r"\D", "", extracted_text)
+        if expected_digits and expected_digits in ocr_digits:
+            return True
+        return field_text_matches(expected_value, extracted_text)
+
+    # Matching estándar
     return field_text_matches(expected_value, extracted_text)
 
 
@@ -644,12 +700,30 @@ def verify_identity(data: VerificationRequest):
         # ── OCR + matching de campos ─────────────────────────────────────
         logger.info("[VERIFY] form_data: %s", data.form_data)
         extracted_text = extract_document_text(ocr_reader, id_img)
+        logger.info("[OCR] Texto completo extraído: %s", extracted_text)
+
+        # Campos que no están en el documento de identidad — no se verifican por OCR
+        # (son datos del sistema/formulario que no aparecen en el carnet)
+        NON_DOCUMENT_FIELDS = {
+            "rg", "estadocivil", "estado_civil", "edad", "nacionalidad",
+            "fechafinalta", "fecha_fin_alta", "direccion", "telefono",
+            "email", "correo", "ocupacion", "profesion",
+        }
 
         field_matches = {}
         for field, expected_value in data.form_data.items():
-            if not expected_value:
-                field_matches[field] = False
+            field_key = field.lower().replace(" ", "")
+
+            # Campo vacío → no verificable
+            if not expected_value or not expected_value.strip():
+                field_matches[field] = None
                 continue
+
+            # Campo que no corresponde al documento → no aplicable, no marcar como error
+            if field_key in NON_DOCUMENT_FIELDS:
+                field_matches[field] = None
+                continue
+
             field_matches[field] = field_text_matches_smart(field, expected_value, extracted_text)
 
         # ── Clasificación del dorso (Opción B) ──────────────────────────

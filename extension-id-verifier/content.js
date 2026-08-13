@@ -4,18 +4,27 @@ const CONFIG = {
   AI_BACKEND_URL: "http://localhost:8001",
   // Palabras que ayudan a identificar los inputs de archivo (selfie vs documento)
   SELFIE_HINTS: ["selfie", "rostro", "retrato"],
-  ID_HINTS: ["id", "documento", "dni", "carnet", "cedula", "identificacion"],
-  // Mapeo de campos del backend a labels/name del formulario
+  ID_HINTS: ["id", "documento", "dni", "carnet", "cedula", "identificacion", "frente", "cip"],
+  BACK_HINTS: ["dorso", "reverso", "back", "trasera"],
+  // Mapeo de campos del backend a labels del formulario
+  // Campos marcados como [no_doc] no se verifican por OCR (no están en el carnet)
   FIELD_MAP: {
-    primerNombre: "Primer Nombre",
-    segundoNombre: "Segundo Nombre",
-    primerApellido: "Primer Apellido",
+    primerNombre:    "Primer Nombre",
+    segundoNombre:   "Segundo Nombre",
+    primerApellido:  "Primer Apellido",
     segundoApellido: "Segundo Apellido",
-    numeroDoc: "Número Documento",
-    tipoDoc: "Tipo Documento",
-    sexo: "Sexo",
+    numeroDoc:       "Número Documento",
+    tipoDoc:         "Tipo Documento",
+    sexo:            "Sexo",
     fechaNacimiento: "Fecha Nacimiento",
   },
+  // Campos del formulario que NO se verifican con OCR del documento
+  // (son datos del sistema, no del carnet) — se envían igual para contexto IA
+  NON_DOC_FIELDS: new Set([
+    "rg", "estadocivil", "estado_civil", "edad", "nacionalidad",
+    "fechafinalta", "fecha_fin_alta", "direccion", "telefono",
+    "email", "correo", "ocupacion", "profesion",
+  ]),
 };
 
 const normalize = (s) =>
@@ -60,34 +69,83 @@ async function collectImages() {
 
   const missing = {
     selfie: { b64: null, img: null },
-    id: { b64: null, img: null },
+    id:     { b64: null, img: null },
     idBack: { b64: null, img: null },
   };
   const used = new Set();
 
-  // 1) Inputs de archivo (fuente más confiable: evita CORS)
+  // ── Estrategia 0: imágenes etiquetadas por texto visible adyacente ─────────
+  // Busca encabezados/labels con texto "Selfie", "Documento frente", "Documento dorso"
+  // y luego localiza el <img> más cercano dentro del mismo contenedor.
+  const LABEL_MAP = [
+    { slot: "selfie", hints: ["selfie", "foto personal", "rostro"] },
+    { slot: "id",     hints: ["documento frente", "cip frente", "frente", "documento"] },
+    { slot: "idBack", hints: ["documento dorso", "cip dorso", "dorso", "reverso"] },
+  ];
+
+  function findImgNearLabel(hintWords) {
+    const allText = Array.from(document.querySelectorAll(
+      "h1,h2,h3,h4,h5,h6,p,span,label,div,td,th,b,strong"
+    ));
+    for (const el of allText) {
+      const norm = normalize(el.textContent);
+      if (hintWords.some((h) => norm === normalize(h) || norm.includes(normalize(h)))) {
+        // Buscar <img> dentro del mismo padre o en el siguiente contenedor hermano
+        const parent = el.closest("div, td, section, article, figure") || el.parentElement;
+        if (!parent) continue;
+        // Buscar en el padre y en el padre del padre
+        for (const container of [parent, parent.parentElement].filter(Boolean)) {
+          const img = container.querySelector("img");
+          if (img && img.src && !used.has(img)) return img;
+        }
+      }
+    }
+    return null;
+  }
+
+  for (const { slot, hints } of LABEL_MAP) {
+    if (missing[slot].b64) continue;
+    const img = findImgNearLabel(hints);
+    if (img) {
+      const b64 = await imgToBase64(img);
+      if (b64) {
+        missing[slot].b64 = b64;
+        missing[slot].img = img;
+        used.add(img);
+        console.info(`[id-verifier] slot '${slot}' desde label: ${img.src.slice(0, 80)}`);
+      }
+    }
+  }
+
+  // ── Estrategia 1: inputs de archivo ───────────────────────────────────────
   const selfieInput = selectFileInput((s) => matchesHints(s, CONFIG.SELFIE_HINTS));
-  const idInput = selectFileInput((s) => matchesHints(s, CONFIG.ID_HINTS));
+  const idInput     = selectFileInput((s) => matchesHints(s, CONFIG.ID_HINTS));
+  const backInput   = selectFileInput((s) => matchesHints(s, CONFIG.BACK_HINTS));
+
   const setFromInput = async (slot, input) => {
     if (!input || missing[slot].b64) return;
     const b64 = await readInputFile(input);
     if (b64) {
       missing[slot].b64 = b64;
       missing[slot].img = null;
-      console.info("[id-verifier] desde input de archivo:", input.name || input.id);
+      console.info("[id-verifier] desde input:", input.name || input.id);
     }
   };
   await setFromInput("selfie", selfieInput);
-  await setFromInput("id", idInput);
+  await setFromInput("id",     idInput);
+  await setFromInput("idBack", backInput);
 
-  const inputs = Array.from(document.querySelectorAll("input[type=file]")).filter((i) => i.files && i.files[0]);
+  // Positional fallback: inputs[0]=selfie, [1]=frente, [2]=dorso
+  const inputs = Array.from(document.querySelectorAll("input[type=file]"))
+    .filter((i) => i.files && i.files[0]);
   await setFromInput("selfie", inputs[0]);
-  await setFromInput("id", inputs[1]);
+  await setFromInput("id",     inputs[1]);
   await setFromInput("idBack", inputs[2]);
 
-  // 2) Previsualizaciones subidas (blob:/data:) EN ORDEN DE DOM:
-  //    selfie → documento frente → documento dorso
-  const previews = images.filter((i) => i.src.startsWith("blob:") || i.src.startsWith("data:"));
+  // ── Estrategia 2: imágenes blob:/data: (previews subidas) ────────────────
+  const previews = images.filter(
+    (i) => i.src.startsWith("blob:") || i.src.startsWith("data:")
+  );
   for (const slot of ["selfie", "id", "idBack"]) {
     if (missing[slot].b64) continue;
     for (const img of previews) {
@@ -97,13 +155,37 @@ async function collectImages() {
       if (b64) {
         missing[slot].b64 = b64;
         missing[slot].img = img;
-        console.info("[id-verifier] desde <img> (preview):", img.src);
+        console.info("[id-verifier] desde preview blob:", img.src.slice(0, 80));
         break;
       }
     }
   }
 
-  // 3) Fallback: cualquier <img> legible si no hay blobs
+  // ── Estrategia 3: imágenes del servidor por ruta (EClub pattern) ──────────
+  // Detecta imágenes cuyas rutas contienen keywords conocidos del formulario
+  const SERVER_PATTERNS = [
+    { slot: "selfie", patterns: [/selfie/i, /rostro/i, /SELFIE/] },
+    { slot: "id",     patterns: [/CIP_FRENTE/i, /frente/i, /front/i, /documento/i] },
+    { slot: "idBack", patterns: [/CIP_DORSO/i, /dorso/i, /back/i, /reverso/i] },
+  ];
+  for (const { slot, patterns } of SERVER_PATTERNS) {
+    if (missing[slot].b64) continue;
+    for (const img of images) {
+      if (used.has(img)) continue;
+      if (patterns.some((p) => p.test(img.src))) {
+        const b64 = await imgToBase64(img);
+        if (b64) {
+          missing[slot].b64 = b64;
+          missing[slot].img = img;
+          used.add(img);
+          console.info(`[id-verifier] slot '${slot}' por ruta de servidor: ${img.src.slice(0, 80)}`);
+          break;
+        }
+      }
+    }
+  }
+
+  // ── Estrategia 4: cualquier <img> legible — fallback general ──────────────
   for (const slot of ["selfie", "id", "idBack"]) {
     if (missing[slot].b64) continue;
     for (const img of images) {
@@ -113,18 +195,18 @@ async function collectImages() {
       if (b64) {
         missing[slot].b64 = b64;
         missing[slot].img = img;
-        console.info("[id-verifier] desde <img> (fallback):", img.src);
+        console.info(`[id-verifier] slot '${slot}' desde fallback general: ${img.src.slice(0, 80)}`);
         break;
       }
     }
   }
 
   return {
-    selfie: missing.selfie.b64,
-    id: missing.id.b64,
-    idBack: missing.idBack.b64,
+    selfie:    missing.selfie.b64,
+    id:        missing.id.b64,
+    idBack:    missing.idBack.b64,
     selfieImg: missing.selfie.img,
-    idImg: missing.id.img,
+    idImg:     missing.id.img,
     idBackImg: missing.idBack.img,
   };
 }
@@ -544,19 +626,28 @@ function renderResults(res) {
   fieldSummary.style.cssText =
     "font-size:11px;color:#aaa;border-top:1px solid rgba(255,255,255,0.15);" +
     "padding-top:6px;margin-top:4px;";
-  const matches    = Object.entries(res.field_matches || {});
-  const matchCount = matches.filter(([, v]) => v).length;
-  fieldSummary.textContent = `Campos: ${matchCount}/${matches.length} coinciden`;
+  const allMatches   = Object.entries(res.field_matches || {});
+  const verifiable   = allMatches.filter(([, v]) => v !== null);
+  const matchCount   = verifiable.filter(([, v]) => v === true).length;
+  const naCount      = allMatches.length - verifiable.length;
+  let summaryText    = `Campos: ${matchCount}/${verifiable.length} coinciden en documento`;
+  if (naCount > 0) summaryText += ` (${naCount} no verificables por OCR)`;
+  fieldSummary.textContent = summaryText;
   badge.appendChild(fieldSummary);
 
   document.body.appendChild(badge);
 
   // ── Resaltar inputs del formulario ────────────────────────────────────────
+  // null  = campo no verificable por OCR → gris (sin borde)
+  // true  = match confirmado             → verde
+  // false = no coincide en documento     → rojo
   for (const [key, isMatch] of Object.entries(res.field_matches || {})) {
     const input = findInputByFieldKey(key);
     if (input) {
-      input.classList.remove("valid-field", "invalid-field");
-      input.classList.add(isMatch ? "valid-field" : "invalid-field");
+      input.classList.remove("valid-field", "invalid-field", "unknown-field");
+      if (isMatch === true)       input.classList.add("valid-field");
+      else if (isMatch === false) input.classList.add("invalid-field");
+      // null → sin clase especial (campo no aplica)
     }
   }
 
