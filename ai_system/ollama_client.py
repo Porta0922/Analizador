@@ -1,16 +1,68 @@
 import httpx
 import json
+import logging
+import threading
+import time
 from typing import Optional, Dict, Any
 
-from .config import OLLAMA_BASE_URL, OLLAMA_VISION_MODEL, OLLAMA_TEXT_MODEL
+from .config import OLLAMA_BASE_URL, OLLAMA_VISION_MODEL, OLLAMA_TEXT_MODEL, OLLAMA_CONCURRENCY
+
+logger = logging.getLogger("ai-system")
 
 
 class OllamaClient:
+    # Fase 4 — Concurrencia y circuit breaker compartidos por todas las instancias.
+    # OLLAMA_CONCURRENCY limita cuántas generaciones corren a la vez (llava 7B no
+    # admite muchas concurrentes en una GPU de 8GB). Después de 3 fallos en 60s
+    # el breaker se abre y las llamadas fallan rápido hasta que se enfría.
+    _sem = threading.Semaphore(max(1, OLLAMA_CONCURRENCY))
+    _state_lock = threading.Lock()
+    _failures = 0
+    _degraded_until = 0.0
+
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = base_url or OLLAMA_BASE_URL
         self.client = httpx.Client(timeout=60.0)
+
+    # ------------------------------------------------------------------
+    # Fase 4 — Circuit breaker
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def is_degraded(cls) -> bool:
+        with cls._state_lock:
+            if cls._degraded_until and time.monotonic() < cls._degraded_until:
+                return True
+            if cls._degraded_until and time.monotonic() >= cls._degraded_until:
+                cls._degraded_until = 0.0
+                cls._failures = 0
+            return False
+
+    @classmethod
+    def _gate(cls) -> bool:
+        """False si el breaker está abierto (Ollama caído o degradado)."""
+        if cls.is_degraded():
+            return False
+        return True
+
+    @classmethod
+    def _record_success(cls):
+        with cls._state_lock:
+            cls._failures = 0
+            cls._degraded_until = 0.0
+
+    @classmethod
+    def _record_failure(cls):
+        with cls._state_lock:
+            cls._failures += 1
+            if cls._failures >= 3:
+                cls._degraded_until = time.monotonic() + 60
+                logger.warning("[OLLAMA] Circuit breaker OPEN (degradado 60s)")
+
+    # ------------------------------------------------------------------
+    # Parsing de respuesta JSON
+    # ------------------------------------------------------------------
     
-    def _parse_json_response(self, response_text: str) -> Dict[str, Any]:
         """
         Extrae el primer objeto JSON válido del texto de respuesta del modelo.
 
@@ -125,6 +177,9 @@ class OllamaClient:
     
     def analyze_image(self, image_b64: str, prompt: str, model: Optional[str] = None) -> Dict[str, Any]:
         """Analyze an image using a vision model."""
+        if not self._gate():
+            return {"error": "ollama_degraded", "message": "Ollama no disponible (circuit breaker)"}
+
         model = model or OLLAMA_VISION_MODEL
         
         # Remove data URI prefix if present
@@ -141,16 +196,14 @@ class OllamaClient:
                 "top_p": 0.9
             }
         }
-        
+
         try:
-            import logging
-            logger = logging.getLogger("ai-system")
-            
-            logger.info("[OLLAMA] Sending request to %s with model %s", self.base_url, model)
-            response = self.client.post(
-                f"{self.base_url}/api/generate",
-                json=payload
-            )
+            with OllamaClient._sem:
+                logger.info("[OLLAMA] Sending request to %s with model %s", self.base_url, model)
+                response = self.client.post(
+                    f"{self.base_url}/api/generate",
+                    json=payload
+                )
             
             logger.info("[OLLAMA] Response status: %d", response.status_code)
             if response.status_code == 200:
@@ -159,16 +212,18 @@ class OllamaClient:
                 logger.info("[OLLAMA] Raw response (first 200 chars): %s", str(raw_response)[:200])
                 parsed = self._parse_json_response(raw_response)
                 logger.info("[OLLAMA] Parsed response: %s", parsed)
+                self._record_success()
                 return parsed
             else:
+                self._record_failure()
                 logger.error("[OLLAMA] HTTP error: %d - %s", response.status_code, response.text[:200])
                 return {"error": f"HTTP {response.status_code}", "details": response.text[:500]}
         
         except httpx.ConnectError:
+            self._record_failure()
             return {"error": "connection_failed", "message": "No se pudo conectar a Ollama. Asegúrese de que esté ejecutándose."}
         except Exception as e:
-            import logging
-            logger = logging.getLogger("ai-system")
+            self._record_failure()
             logger.error("[OLLAMA] Exception: %s", str(e))
             return {"error": str(e)}
     
@@ -185,8 +240,10 @@ class OllamaClient:
         la segunda es la imagen B (foto del documento).
         Ambos b64 deben estar sin prefijo data URI.
         """
-        import logging
-        logger = logging.getLogger("ai-system")
+        if not self._gate():
+            return {"error": "ollama_degraded", "face_match_score": -1,
+                    "message": "Ollama no disponible (circuit breaker)"}
+
         model = model or OLLAMA_VISION_MODEL
 
         payload = {
@@ -201,28 +258,36 @@ class OllamaClient:
         }
 
         try:
-            logger.info("[OLLAMA] Sending image-pair request to %s (model=%s)", self.base_url, model)
-            response = self.client.post(f"{self.base_url}/api/generate", json=payload)
+            with OllamaClient._sem:
+                logger.info("[OLLAMA] Sending image-pair request to %s (model=%s)", self.base_url, model)
+                response = self.client.post(f"{self.base_url}/api/generate", json=payload)
             logger.info("[OLLAMA] Response status: %d", response.status_code)
 
             if response.status_code == 200:
                 result      = response.json()
                 raw_response = result.get("response", "")
                 logger.info("[OLLAMA] Raw face-pair response (200 chars): %s", str(raw_response)[:200])
+                self._record_success()
                 return self._parse_json_response(raw_response)
             else:
+                self._record_failure()
                 logger.error("[OLLAMA] HTTP error: %d - %s", response.status_code, response.text[:200])
                 return {"error": f"HTTP {response.status_code}", "face_match_score": -1}
 
         except httpx.ConnectError:
+            self._record_failure()
             return {"error": "connection_failed", "face_match_score": -1,
                     "message": "No se pudo conectar a Ollama."}
         except Exception as e:
+            self._record_failure()
             logger.error("[OLLAMA] Exception in analyze_image_pair: %s", str(e))
             return {"error": str(e), "face_match_score": -1}
 
     def analyze_text(self, text: str, prompt: str, model: Optional[str] = None) -> Dict[str, Any]:
         """Analyze text using a language model."""
+        if not self._gate():
+            return {"error": "ollama_degraded", "message": "Ollama no disponible (circuit breaker)"}
+
         model = model or OLLAMA_TEXT_MODEL
         
         full_prompt = f"{prompt}\n\nDatos para analizar:\n{text}"
@@ -238,14 +303,12 @@ class OllamaClient:
         }
         
         try:
-            import logging
-            logger = logging.getLogger("ai-system")
-            
-            logger.info("[OLLAMA] Sending text request to model %s", model)
-            response = self.client.post(
-                f"{self.base_url}/api/generate",
-                json=payload
-            )
+            with OllamaClient._sem:
+                logger.info("[OLLAMA] Sending text request to model %s", model)
+                response = self.client.post(
+                    f"{self.base_url}/api/generate",
+                    json=payload
+                )
             
             logger.info("[OLLAMA] Response status: %d", response.status_code)
             if response.status_code == 200:
@@ -254,16 +317,18 @@ class OllamaClient:
                 logger.info("[OLLAMA] Raw response (first 200 chars): %s", str(raw_response)[:200])
                 parsed = self._parse_json_response(raw_response)
                 logger.info("[OLLAMA] Parsed response: %s", parsed)
+                self._record_success()
                 return parsed
             else:
+                self._record_failure()
                 logger.error("[OLLAMA] HTTP error: %d - %s", response.status_code, response.text[:200])
                 return {"error": f"HTTP {response.status_code}", "details": response.text[:500]}
         
         except httpx.ConnectError:
+            self._record_failure()
             return {"error": "connection_failed", "message": "No se pudo conectar a Ollama. Asegúrese de que está ejecutándose."}
         except Exception as e:
-            import logging
-            logger = logging.getLogger("ai-system")
+            self._record_failure()
             logger.error("[OLLAMA] Exception: %s", str(e))
             return {"error": str(e)}
     

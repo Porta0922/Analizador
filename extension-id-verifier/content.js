@@ -343,10 +343,10 @@ async function verify() {
     if (!resp.ok) throw new Error(data.detail || `Error del servidor (${resp.status})`);
     renderResults(data);
 
-    // Call AI backend for additional analysis (once only)
+    // Call AI backend for the unified decision (once only)
     if (!document.getElementById("ai-analysis-section")) {
-      analyzeWithAI(selfie, id, idBack, formData, data.field_matches || null).then((aiResult) => {
-        if (aiResult && aiResult.result && !document.getElementById("ai-analysis-section")) {
+      analyzeWithAI(selfie, id, idBack, formData, data).then((aiResult) => {
+        if (aiResult && aiResult.decision && !document.getElementById("ai-analysis-section")) {
           renderAIResults(aiResult);
         }
       }).catch(() => {});
@@ -683,167 +683,149 @@ function renderResults(res) {
 
 function renderAIResults(aiResult) {
   const badge = document.getElementById("selfie-similarity-badge");
-  if (!badge || !aiResult || !aiResult.result) return;
+  if (!badge || !aiResult || !aiResult.decision) return;
 
-  const result      = aiResult.result;
-  const shouldReject = aiResult.should_reject;
+  const decision = aiResult.decision;
+  const ai       = aiResult.ai_analysis || null;
+  const approved = !!decision.approved;
 
   const aiDiv = document.createElement("div");
   aiDiv.id = "ai-analysis-section";
   aiDiv.style.cssText =
     "margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.3);";
 
-  // ── Header IA ─────────────────────────────────────────────────────────────
+  // ── Veredicto IA (prominente) ─────────────────────────────────────────────
   const header = document.createElement("div");
   header.style.cssText =
-    "font-weight:bold;margin-bottom:5px;color:" + (shouldReject ? "#f44336" : "#4caf50") + ";";
-  header.textContent = shouldReject ? "IA: RECHAZADO" : "IA: APROBADO";
+    `font-weight:bold;font-size:14px;margin-bottom:3px;` +
+    `color:${approved ? "#4caf50" : "#f44336"};`;
+  header.textContent = approved ? "✓ IA: APROBADO" : "✗ IA: RECHAZADO";
   aiDiv.appendChild(header);
 
-  // ── Scores base ───────────────────────────────────────────────────────────
-  const scores = document.createElement("div");
-  scores.style.cssText = "font-size:10px;color:#ccc;margin-bottom:4px;";
-  scores.textContent =
-    `Coherencia: ${result.coherence_score}% | ` +
-    `Integridad: ${result.tampering_score}% | ` +
-    `Confianza: ${result.overall_confidence}%`;
-  aiDiv.appendChild(scores);
+  const risk = document.createElement("div");
+  risk.style.cssText = "font-size:10px;color:#ccc;margin-bottom:4px;";
+  risk.textContent = `Riesgo: ${decision.risk_score}% (veredicto v${decision.verdict_version})`;
+  aiDiv.appendChild(risk);
 
-  // ── Opción D: Face match por IA ───────────────────────────────────────────
-  if (result.face_match_score != null && result.face_match_score >= 0) {
-    const fmScore  = result.face_match_score;
-    const fmOk     = fmScore >= 60;
-    const fmColor  = fmOk ? "#4caf50" : "#f44336";
-    const fmBg     = fmOk ? "rgba(76,175,80,0.12)" : "rgba(244,67,54,0.12)";
-    const fmBorder = fmOk ? "#4caf50" : "#f44336";
-
-    const fmDiv = document.createElement("div");
-    fmDiv.style.cssText =
-      `background:${fmBg};border-left:3px solid ${fmBorder};` +
-      `padding:4px 6px;border-radius:0 4px 4px 0;margin-bottom:4px;`;
-
-    const fmTitle = document.createElement("div");
-    fmTitle.style.cssText = `font-size:10px;font-weight:bold;color:${fmColor};margin-bottom:2px;`;
-    fmTitle.textContent = `${fmOk ? "✓" : "✗"} IA Facial: ${fmScore}% de coincidencia`;
-    fmDiv.appendChild(fmTitle);
-
-    if (result.face_match_reasoning) {
-      const fmReason = document.createElement("div");
-      fmReason.style.cssText = "font-size:9px;color:#bbb;line-height:1.3;";
-      fmReason.textContent = result.face_match_reasoning;
-      fmDiv.appendChild(fmReason);
+  // ── Razones de la decisión ────────────────────────────────────────────────
+  if (decision.reasons && decision.reasons.length > 0) {
+    const reasons = document.createElement("div");
+    reasons.style.cssText = "font-size:9px;line-height:1.4;margin-bottom:4px;text-align:left;";
+    for (const r of decision.reasons) {
+      const line = document.createElement("div");
+      const color =
+        r.severity === "critical" ? "#f44336" :
+        r.severity === "warning" ? "#ff9800" : "#8bc34a";
+      line.style.cssText = `color:${color};`;
+      line.textContent = `• ${r.message || r.code}`;
+      reasons.appendChild(line);
     }
-
-    if (result.face_match_issues && result.face_match_issues.length > 0) {
-      const fmIssues = document.createElement("div");
-      fmIssues.style.cssText = "font-size:9px;color:#ff9800;margin-top:2px;";
-      fmIssues.textContent = "⚠ " + result.face_match_issues.join(" · ");
-      fmDiv.appendChild(fmIssues);
-    }
-
-    aiDiv.appendChild(fmDiv);
+    aiDiv.appendChild(reasons);
   }
 
-  // ── Opción D: Verificación del dorso por IA ───────────────────────────────
-  if (result.back_analysis_score != null && result.back_analysis_score >= 0) {
-    const bScore  = result.back_analysis_score;
-    const isBack  = bScore >= 50;
-    const bColor  = isBack ? "#4caf50" : "#f44336";
-    const bBg     = isBack ? "rgba(76,175,80,0.12)" : "rgba(244,67,54,0.12)";
+  // ── Scores del análisis IA (si la IA estuvo disponible) ───────────────────
+  if (ai) {
+    const scores = document.createElement("div");
+    scores.style.cssText = "font-size:10px;color:#ccc;margin-bottom:4px;";
+    scores.textContent =
+      `Coherencia: ${ai.coherence_score}% | ` +
+      `Integridad: ${ai.tampering_score}% | ` +
+      `Confianza: ${ai.overall_confidence}%`;
+    aiDiv.appendChild(scores);
 
-    const bDiv = document.createElement("div");
-    bDiv.style.cssText =
-      `background:${bBg};border-left:3px solid ${bColor};` +
-      `padding:4px 6px;border-radius:0 4px 4px 0;margin-bottom:4px;`;
-
-    const bTitle = document.createElement("div");
-    bTitle.style.cssText = `font-size:10px;font-weight:bold;color:${bColor};margin-bottom:2px;`;
-    bTitle.textContent = isBack
-      ? `✓ Dorso verificado por IA (${bScore}%)`
-      : `✗ IA: la imagen del dorso no parece ser el reverso del documento (${bScore}%)`;
-    bDiv.appendChild(bTitle);
-
-    if (!isBack) {
-      const bWarn = document.createElement("div");
-      bWarn.style.cssText = "font-size:9px;color:#ff9800;margin-top:2px;";
-      bWarn.textContent = "Posiblemente se subió el frente del documento dos veces.";
-      bDiv.appendChild(bWarn);
+    // Face match por IA
+    if (ai.face_match_score != null && ai.face_match_score >= 0) {
+      const fmScore = ai.face_match_score;
+      const fmOk    = fmScore >= 60;
+      const fmDiv = document.createElement("div");
+      fmDiv.style.cssText =
+        `font-size:10px;color:${fmOk ? "#4caf50" : "#f44336"};margin-bottom:2px;`;
+      fmDiv.textContent = `${fmOk ? "✓" : "✗"} IA Facial: ${fmScore}%`;
+      aiDiv.appendChild(fmDiv);
     }
 
-    if (result.back_analysis_issues && result.back_analysis_issues.length > 0) {
-      const bIssues = document.createElement("div");
-      bIssues.style.cssText = "font-size:9px;color:#ff9800;margin-top:2px;";
-      bIssues.textContent = "⚠ " + result.back_analysis_issues.join(" · ");
-      bDiv.appendChild(bIssues);
+    // Dorso por IA
+    if (ai.back_analysis_score != null && ai.back_analysis_score >= 0) {
+      const bScore = ai.back_analysis_score;
+      const isBack = bScore >= 50;
+      const bDiv = document.createElement("div");
+      bDiv.style.cssText = `font-size:10px;color:${isBack ? "#4caf50" : "#f44336"};margin-bottom:2px;`;
+      bDiv.textContent = isBack
+        ? `✓ Dorso verificado por IA (${bScore}%)`
+        : `✗ Dorso no parece el reverso del documento (${bScore}%)`;
+      aiDiv.appendChild(bDiv);
     }
 
-    aiDiv.appendChild(bDiv);
-  }
+    // Problemas de coherencia
+    if (ai.coherence_issues && ai.coherence_issues.length > 0) {
+      const issues = document.createElement("div");
+      issues.style.cssText = "font-size:10px;color:#ff9800;margin-top:3px;";
+      const issueList = ai.coherence_issues.map(
+        (i) => (typeof i === "object" ? i.reason || i.message || JSON.stringify(i) : i)
+      );
+      issues.textContent = "Problemas: " + issueList.join(", ");
+      aiDiv.appendChild(issues);
+    }
 
-  // ── Problemas de coherencia ───────────────────────────────────────────────
-  if (result.coherence_issues && result.coherence_issues.length > 0) {
-    const issues = document.createElement("div");
-    issues.style.cssText = "font-size:10px;color:#ff9800;margin-top:3px;";
-    const issueList = result.coherence_issues.map(
-      (i) => (typeof i === "object" ? i.reason || i.message || JSON.stringify(i) : i)
+    // Áreas sospechosas (tampering)
+    if (ai.tampering_areas && ai.tampering_areas.length > 0) {
+      const areas = document.createElement("div");
+      areas.style.cssText = "font-size:10px;color:#ff9800;margin-top:2px;";
+      const areaList = ai.tampering_areas.map(
+        (a) => (typeof a === "object" ? a.area || a.reason || JSON.stringify(a) : a)
+      );
+      areas.textContent = "Áreas sospechosas: " + areaList.join(", ");
+      aiDiv.appendChild(areas);
+    }
+
+    // Etapa 2: campos re-verificados visualmente por llava
+    const visMatches = ai.visual_field_matches || {};
+    const visEntries = Object.entries(visMatches).filter(
+      ([, v]) => typeof v === "boolean"
     );
-    issues.textContent = "Problemas: " + issueList.join(", ");
-    aiDiv.appendChild(issues);
-  }
+    if (visEntries.length > 0) {
+      const visDiv = document.createElement("div");
+      visDiv.style.cssText = "font-size:9px;color:#aaa;margin-top:4px;line-height:1.4;";
 
-  // ── Áreas sospechosas (tampering) ────────────────────────────────────────
-  if (result.tampering_areas && result.tampering_areas.length > 0) {
-    const areas = document.createElement("div");
-    areas.style.cssText = "font-size:10px;color:#ff9800;margin-top:2px;";
-    const areaList = result.tampering_areas.map(
-      (a) => (typeof a === "object" ? a.area || a.reason || JSON.stringify(a) : a)
-    );
-    areas.textContent = "Áreas sospechosas: " + areaList.join(", ");
-    aiDiv.appendChild(areas);
-  }
+      const visTitle = document.createElement("div");
+      visTitle.style.cssText = "font-weight:bold;color:#e0e0e0;margin-bottom:2px;";
+      visTitle.textContent = "Re-verificados visualmente (llava):";
+      visDiv.appendChild(visTitle);
 
-  // ── Etapa 2: campos re-verificados visualmente por llava ─────────────────
-  const visMatches = result.visual_field_matches || {};
-  const visEntries = Object.entries(visMatches).filter(
-    ([, v]) => typeof v === "boolean"
-  );
-  if (visEntries.length > 0) {
-    const visDiv = document.createElement("div");
-    visDiv.style.cssText = "font-size:9px;color:#aaa;margin-top:4px;line-height:1.4;";
+      const visList = document.createElement("div");
+      visList.textContent = visEntries
+        .map(([field, ok]) => `${ok ? "✓" : "✗"} ${field}`)
+        .join("  ·  ");
+      visDiv.appendChild(visList);
 
-    const visTitle = document.createElement("div");
-    visTitle.style.cssText = "font-weight:bold;color:#e0e0e0;margin-bottom:2px;";
-    visTitle.textContent = "Re-verificados visualmente (llava):";
-    visDiv.appendChild(visTitle);
+      aiDiv.appendChild(visDiv);
 
-    const visList = document.createElement("div");
-    visList.textContent = visEntries
-      .map(([field, ok]) => `${ok ? "✓" : "✗"} ${field}`)
-      .join("  ·  ");
-    visDiv.appendChild(visList);
-
-    aiDiv.appendChild(visDiv);
-
-    // Re-pintar los inputs que OCR marcó como fallidos pero llava confirmó,
-    // y actualizar el resumen "Campos: X/Y"
-    const summaryEl = badge.querySelector(".field-summary");
-    let confirmedCount = 0;
-    for (const [key, ok] of visEntries) {
-      const input = findInputByFieldKey(key);
-      if (!input) continue;
-      input.classList.remove("valid-field", "invalid-field", "unknown-field");
-      input.classList.add(ok ? "valid-field" : "invalid-field");
-      if (ok) confirmedCount++;
-    }
-    if (summaryEl && confirmedCount > 0) {
-      const m = summaryEl.textContent.match(/(\d+)\/(\d+)/);
-      if (m) {
-        const [all, ok] = [parseInt(m[2], 10), parseInt(m[1], 10)];
-        summaryEl.textContent =
-          `Campos: ${ok + confirmedCount}/${all} coinciden en documento ` +
-          `(${confirmedCount} confirmados por IA)`;
+      // Re-pintar inputs que OCR marcó como fallidos pero llava confirmó,
+      // y actualizar el resumen "Campos: X/Y"
+      const summaryEl = badge.querySelector(".field-summary");
+      let confirmedCount = 0;
+      for (const [key, ok] of visEntries) {
+        const input = findInputByFieldKey(key);
+        if (!input) continue;
+        input.classList.remove("valid-field", "invalid-field", "unknown-field");
+        input.classList.add(ok ? "valid-field" : "invalid-field");
+        if (ok) confirmedCount++;
+      }
+      if (summaryEl && confirmedCount > 0) {
+        const m = summaryEl.textContent.match(/(\d+)\/(\d+)/);
+        if (m) {
+          const [all, ok] = [parseInt(m[2], 10), parseInt(m[1], 10)];
+          summaryEl.textContent =
+            `Campos: ${ok + confirmedCount}/${all} coinciden en documento ` +
+            `(${confirmedCount} confirmados por IA)`;
+        }
       }
     }
+  } else {
+    const noAi = document.createElement("div");
+    noAi.style.cssText = "font-size:10px;color:#ff9800;margin-bottom:3px;";
+    noAi.textContent = "⚠ Análisis IA no disponible (Ollama caído). Veredicto basado solo en señales deterministas.";
+    aiDiv.appendChild(noAi);
   }
 
   // ── Botones de feedback ───────────────────────────────────────────────────
@@ -1022,9 +1004,25 @@ function currentSelfieImg() {
 // AI Analysis Functions
 // ---------------------------------------------------------------------------
 
-async function analyzeWithAI(selfieB64, idFrontB64, idBackB64, formData, ocrFieldMatches) {
+async function analyzeWithAI(selfieB64, idFrontB64, idBackB64, formData, verifyResponse) {
   try {
-    const resp = await fetch(`${CONFIG.AI_BACKEND_URL}/ai/analyze`, {
+    const verify = verifyResponse || {};
+
+    // Señales del /verify que alimentan el motor de decisión
+    const verifySignals = {
+      facial_similarity: verify.facial_similarity ?? null,
+      face_detected: verify.face_detected ?? null,
+      is_same_person: verify.is_same_person ?? null,
+      field_matches: verify.field_matches || {},
+      is_selfie_fraud: verify.is_selfie_fraud ?? null,
+      selfie_doc_similarity: verify.selfie_doc_similarity ?? null,
+      fraud_reason: verify.fraud_reason || "none",
+      back_document_status: verify.back_document_status || null,
+      back_similarity: verify.back_similarity ?? null,
+      is_document_duplicate: verify.is_document_duplicate ?? null,
+    };
+
+    const resp = await fetch(`${CONFIG.AI_BACKEND_URL}/ai/decision`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1032,18 +1030,20 @@ async function analyzeWithAI(selfieB64, idFrontB64, idBackB64, formData, ocrFiel
         doc_front_b64: idFrontB64,
         doc_back_b64: idBackB64 || null,
         form_data: formData,
-        ocr_field_matches: ocrFieldMatches || null,
+        ocr_field_matches: verify.field_matches || null,
+        verify_signals: verifySignals,
+        selfie_embedding: Array.isArray(verify.selfie_embedding) ? verify.selfie_embedding : null,
       }),
     });
 
     if (!resp.ok) {
-      console.warn("[id-verifier] AI analysis failed:", resp.status);
+      console.warn("[id-verifier] AI decision failed:", resp.status);
       return null;
     }
 
     return await resp.json();
   } catch (err) {
-    console.warn("[id-verifier] AI analysis error:", err.message);
+    console.warn("[id-verifier] AI decision error:", err.message);
     return null;
   }
 }

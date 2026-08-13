@@ -24,6 +24,23 @@ COHERENCE_THRESHOLD = float(os.getenv("COHERENCE_THRESHOLD", "70.0"))
 TAMPERING_THRESHOLD = float(os.getenv("TAMPERING_THRESHOLD", "80.0"))
 OVERALL_CONFIDENCE_THRESHOLD = float(os.getenv("OVERALL_CONFIDENCE_THRESHOLD", "60.0"))
 
+# Motor de decisión (Fase 1) — veredicto binario APROBADO/RECHAZADO
+VERDICT_VERSION = os.getenv("VERDICT_VERSION", "1.0.0")
+APPROVAL_THRESHOLD = float(os.getenv("APPROVAL_THRESHOLD", "70.0"))
+# Si es true, no se puede aprobar cuando Ollama está caído (dato insuficiente)
+AI_REQUIRED_FOR_APPROVAL = os.getenv("AI_REQUIRED_FOR_APPROVAL", "true").lower() in ("1", "true", "yes", "on")
+
+# Antifraude entre solicitudes (Fase 3)
+ENABLE_CROSS_REQUEST_FRAUD = os.getenv("ENABLE_CROSS_REQUEST_FRAUD", "true").lower() in ("1", "true", "yes", "on")
+# Similitud facial mínima entre la selfie actual y las de análisis previos del mismo CI.
+# Por debajo de esto → mismo documento con cara distinta (posible fraude).
+FRAUD_RING_SIM_THRESHOLD = float(os.getenv("FRAUD_RING_SIM_THRESHOLD", "60.0"))
+
+# Robustez / latencia (Fase 4)
+AI_TAMPERING_CACHE = os.getenv("AI_TAMPERING_CACHE", "true").lower() in ("1", "true", "yes", "on")
+AI_TAMPERING_CACHE_SIZE = int(os.getenv("AI_TAMPERING_CACHE_SIZE", "100"))
+OLLAMA_CONCURRENCY = int(os.getenv("OLLAMA_CONCURRENCY", "1"))
+
 # Learning parameters
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "0.1"))
 MIN_CORRECTIONS_FOR_PATTERN = int(os.getenv("MIN_CORRECTIONS_FOR_PATTERN", "3"))

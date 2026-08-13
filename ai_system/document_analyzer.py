@@ -4,6 +4,8 @@ import base64
 import logging
 import re
 import unicodedata
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -13,6 +15,8 @@ from .config import (
     OVERALL_CONFIDENCE_THRESHOLD,
     PROMPTS_DIR,
     PATTERN_CONFIDENCE_THRESHOLD,
+    AI_TAMPERING_CACHE,
+    AI_TAMPERING_CACHE_SIZE,
 )
 from .ollama_client import OllamaClient
 from .database import Database
@@ -62,6 +66,10 @@ class DocumentAnalyzer:
         self.db = db
         self.patterns = self._load_learned_patterns()
         self._load_prompts()
+        # Fase 4 — cache de tampering por hash de imagen (la llamada más cara)
+        self._tamper_cache: OrderedDict[str, dict] = OrderedDict()
+        self._tamper_cache_enabled = AI_TAMPERING_CACHE
+        self._tamper_cache_size = max(1, AI_TAMPERING_CACHE_SIZE)
 
     # ------------------------------------------------------------------
     # Prompt loading
@@ -269,21 +277,37 @@ class DocumentAnalyzer:
         coherence = self._analyze_coherence(form_data)
         logger.info("[AI] Coherence result: %s", coherence)
 
-        logger.info("[AI] Starting tampering detection...")
-        tampering = self._detect_tampering(doc_front_b64)
-        logger.info("[AI] Tampering result: %s", tampering)
+        # Fase 4 — las 3 llamadas de visión (tampering, face, dorso) son
+        # independientes: se lanzan en paralelo. La concurrencia real está
+        # limitada por el semáforo de OllamaClient (OLLAMA_CONCURRENCY).
+        def _run_vision_stage():
+            logger.info("[AI] Starting tampering detection...")
+            tam = self._detect_tampering(doc_front_b64)
+            logger.info("[AI] Tampering result: %s", tam)
+            return tam
 
-        # Análisis facial por IA
-        logger.info("[AI] Starting face match analysis...")
-        face_match = self._analyze_face_match(selfie_b64, doc_front_b64)
-        logger.info("[AI] Face match result: %s", face_match)
+        def _run_face_stage():
+            logger.info("[AI] Starting face match analysis...")
+            fm = self._analyze_face_match(selfie_b64, doc_front_b64)
+            logger.info("[AI] Face match result: %s", fm)
+            return fm
 
-        # Verificación del dorso
-        back_analysis: Optional[dict] = None
-        if doc_back_b64:
+        def _run_back_stage():
+            if not doc_back_b64:
+                return None
             logger.info("[AI] Starting back document verification...")
-            back_analysis = self._verify_back_document(doc_back_b64)
-            logger.info("[AI] Back document result: %s", back_analysis)
+            bk = self._verify_back_document(doc_back_b64)
+            logger.info("[AI] Back document result: %s", bk)
+            return bk
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            tampering_future = executor.submit(_run_vision_stage)
+            face_future      = executor.submit(_run_face_stage)
+            back_future      = executor.submit(_run_back_stage)
+
+            tampering = tampering_future.result()
+            face_match = face_future.result()
+            back_analysis = back_future.result()
 
         # ── Etapa 2: extracción visual de campos que el OCR no confirmó ───────
         visual_field_matches: Dict[str, Optional[bool]] = {}
@@ -417,12 +441,26 @@ class DocumentAnalyzer:
     def _detect_tampering(self, image_b64: str) -> dict:
         """Detect tampering using vision model with full 3-layer prompt."""
         try:
+            # Fase 4 — cache LRU por hash de imagen: misma imagen → mismo veredicto
+            if self._tamper_cache_enabled:
+                img_hash = self._calculate_image_hash(image_b64)
+                cached = self._tamper_cache.get(img_hash)
+                if cached is not None:
+                    logger.info("[AI] Tampering cache HIT for %s", img_hash[:8])
+                    return dict(cached)
+
             prompt = self._build_system_prompt("detect_tampering")
             logger.info("[AI] Calling Ollama for tampering detection...")
             response = self.ollama.analyze_image(image_b64, prompt)
             logger.info("[AI] Raw tampering response: %s", str(response)[:200])
             result = self._extract_json_from_response(response)
             logger.info("[AI] Extracted tampering result: %s", result)
+
+            if self._tamper_cache_enabled and "error" not in result:
+                self._tamper_cache[img_hash] = dict(result)
+                while len(self._tamper_cache) > self._tamper_cache_size:
+                    self._tamper_cache.popitem(last=False)
+
             return result
         except Exception as e:
             logger.error("[AI] Tampering detection error: %s", str(e))

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 from .config import DATABASE_PATH
 from .models import AnalysisResult, UserFeedback, Correction, LearnedPattern
+from .decision_engine import DecisionResult
 
 
 class Database:
@@ -96,6 +97,32 @@ class Database:
                     trigger_event TEXT DEFAULT 'manual'
                 )
             """)
+
+            # Antifraude entre solicitudes (Fase 3) — embeddings faciales por análisis
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS face_embeddings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    analysis_id INTEGER REFERENCES analyses(id),
+                    numero_doc_hash TEXT,
+                    selfie_embedding JSON,
+                    selfie_hash TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Migración idempotente: columnas de decisión en analyses (Fase 1/2)
+            _existing = [row["name"] for row in cursor.execute("PRAGMA table_info(analyses)")]
+            _decision_cols = {
+                "risk_score": "REAL",
+                "verdict": "TEXT",
+                "decision_reasons": "JSON",
+                "signal_scores": "JSON",
+                "decision_ts": "DATETIME",
+                "override_by": "TEXT",
+            }
+            for _col, _ctype in _decision_cols.items():
+                if _col not in _existing:
+                    cursor.execute(f"ALTER TABLE analyses ADD COLUMN {_col} {_ctype}")
 
     # ------------------------------------------------------------------
     # Analysis CRUD
@@ -487,3 +514,187 @@ class Database:
             # Return chronological order for charting
             rows.reverse()
             return rows
+
+    # ------------------------------------------------------------------
+    # Decisiones (Fase 1) — persistencia del veredicto por análisis
+    # ------------------------------------------------------------------
+
+    def save_decision(self, analysis_id: int, decision: DecisionResult):
+        """Almacena el veredicto binario y su desglose para auditoría."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE analyses SET
+                    risk_score = ?,
+                    verdict = ?,
+                    decision_reasons = ?,
+                    signal_scores = ?,
+                    decision_ts = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (
+                decision.risk_score,
+                decision.verdict,
+                json.dumps(decision.reasons),
+                json.dumps(decision.signals),
+                analysis_id,
+            ))
+
+    # ------------------------------------------------------------------
+    # Antifraude entre solicitudes (Fase 3)
+    # ------------------------------------------------------------------
+
+    def save_face_embeddings(self, analysis_id: int, numero_doc_hash: str,
+                             selfie_embedding: list, selfie_hash: str):
+        """Guarda el embedding de la selfie para comparaciones futuras."""
+        if not selfie_embedding:
+            return
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO face_embeddings (
+                    analysis_id, numero_doc_hash, selfie_embedding, selfie_hash
+                ) VALUES (?, ?, ?, ?)
+            """, (
+                analysis_id,
+                numero_doc_hash,
+                json.dumps(selfie_embedding),
+                selfie_hash,
+            ))
+
+    def query_same_doc_embeddings(self, numero_doc_hash: str, limit: int = 10) -> List[dict]:
+        """Embeddings previos de selfies asociados al mismo CI."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT analysis_id, selfie_embedding, selfie_hash, created_at
+                FROM face_embeddings
+                WHERE numero_doc_hash = ? AND selfie_embedding IS NOT NULL
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (numero_doc_hash, limit))
+            rows = []
+            for row in cursor.fetchall():
+                emb = json.loads(row["selfie_embedding"]) if row["selfie_embedding"] else []
+                rows.append({
+                    "analysis_id": row["analysis_id"],
+                    "selfie_embedding": emb,
+                    "selfie_hash": row["selfie_hash"],
+                    "created_at": row["created_at"],
+                })
+            return rows
+
+    def query_selfie_hashes_other_docs(self, selfie_hash: str, exclude_doc_hash: str, limit: int = 10) -> List[dict]:
+        """Otros análisis donde se usó la misma selfie con un documento distinto."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT analysis_id, numero_doc_hash, created_at
+                FROM face_embeddings
+                WHERE selfie_hash = ? AND numero_doc_hash != ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (selfie_hash, exclude_doc_hash, limit))
+            return [dict(row) for row in cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Auditoría (Fase 2)
+    # ------------------------------------------------------------------
+
+    def get_decision_by_id(self, analysis_id: int) -> Optional[dict]:
+        """Registro completo de un análisis + decisión + correcciones."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM analyses WHERE id = ?", (analysis_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            result = dict(row)
+            result["field_matches"] = json.loads(result.get("field_matches") or "{}")
+            result["ai_extraction"] = json.loads(result.get("ai_extraction") or "{}")
+            result["decision_reasons"] = json.loads(result.get("decision_reasons") or "[]")
+            result["signal_scores"] = json.loads(result.get("signal_scores") or "{}")
+            result["user_corrections"] = json.loads(result.get("user_corrections") or "[]")
+
+            cursor.execute("""
+                SELECT * FROM corrections WHERE analysis_id = ? ORDER BY id
+            """, (analysis_id,))
+            result["corrections"] = [dict(r) for r in cursor.fetchall()]
+            return result
+
+    def export_analyses(self, limit: int = 500) -> List[dict]:
+        """Listado plano para exportación/auditoría."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, timestamp, face_similarity, field_matches,
+                       ai_coherence_score, ai_tampering_score, ai_overall_confidence,
+                       risk_score, verdict, user_confirmed,
+                       processing_time_ms, model_version, override_by
+                FROM analyses
+                ORDER BY id DESC
+                LIMIT ?
+            """, (limit,))
+            rows = []
+            for row in cursor.fetchall():
+                r = dict(row)
+                r["field_matches"] = json.loads(r.get("field_matches") or "{}")
+                rows.append(r)
+            return rows
+
+    # ------------------------------------------------------------------
+    # Dashboard de operación (Fase 6)
+    # ------------------------------------------------------------------
+
+    def get_dashboard_stats(self) -> dict:
+        """Métricas operativas: aprobación/rechazo, razones, tiempos."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) AS total FROM analyses")
+            total = cursor.fetchone()["total"]
+
+            cursor.execute("SELECT COUNT(*) AS n FROM analyses WHERE verdict = 'approved'")
+            approved = cursor.fetchone()["n"]
+
+            cursor.execute("SELECT COUNT(*) AS n FROM analyses WHERE verdict = 'rejected'")
+            rejected = cursor.fetchone()["n"]
+
+            cursor.execute("""
+                SELECT AVG(risk_score) AS avg_risk,
+                       AVG(processing_time_ms) AS avg_ms
+                FROM analyses WHERE risk_score IS NOT NULL
+            """)
+            row = cursor.fetchone()
+            avg_risk = round(row["avg_risk"] or 0.0, 2)
+            avg_ms = int(row["avg_ms"] or 0)
+
+            # Distribución de razones de rechazo (se parsea en Python)
+            cursor.execute("""
+                SELECT decision_reasons FROM analyses
+                WHERE decision_reasons IS NOT NULL AND decision_reasons != '[]'
+                ORDER BY id DESC LIMIT 200
+            """)
+            reason_counts: Dict[str, int] = {}
+            for r in cursor.fetchall():
+                try:
+                    reasons = json.loads(r["decision_reasons"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                for item in reasons:
+                    code = item.get("code", "UNKNOWN")
+                    reason_counts[code] = reason_counts.get(code, 0) + 1
+
+            top_reasons = sorted(
+                reason_counts.items(), key=lambda kv: kv[1], reverse=True
+            )[:10]
+
+            return {
+                "total": total,
+                "approved": approved,
+                "rejected": rejected,
+                "approval_rate": round(approved / total * 100, 1) if total else 0.0,
+                "avg_risk_score": avg_risk,
+                "avg_processing_time_ms": avg_ms,
+                "top_reasons": [{"code": code, "count": count} for code, count in top_reasons],
+                "top_error_fields": self.get_top_error_fields(5),
+            }

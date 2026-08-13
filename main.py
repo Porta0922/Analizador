@@ -2,12 +2,14 @@ import base64
 import logging
 import os
 import re
+import threading
 import traceback
 
 import cv2
 import easyocr
 import numpy as np
 import torch
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from facenet_pytorch import InceptionResnetV1, MTCNN
@@ -61,6 +63,11 @@ if _legacy > 0:
 BACK_IDENTICAL_THRESHOLD = float(os.getenv("BACK_IDENTICAL_THRESHOLD", "92.0"))
 
 app = FastAPI(title="Verificación de Identidad Local GPU", version="4.0")
+
+# Fase 4 — Guardia de concurrencia: MTCNN / FaceNet / EasyOCR no son
+# thread-safe sobre GPU. FastAPI ejecuta endpoints sync en un threadpool,
+# así que sin esto dos /verify concurrentes podrían corromper la GPU.
+_GPU_LOCK = threading.Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -197,7 +204,8 @@ def _crop_face_from_box(cv2_img, x, y, w, h, padding_ratio: float = 0.20):
 def _embedding_from_crop(face_crop_cv2):
     """
     Genera embedding FaceNet desde un recorte de cara (imagen OpenCV).
-    Intenta MTCNN primero sobre el recorte; si falla, normaliza directo.
+    Intenta MTCNN primero sobre el recorte; si falla, hace upscale del recorte
+    (cara pequeña en documentos) y reintenta; por último normaliza directo.
     """
     rgb         = _cv2_to_rgb(face_crop_cv2)
     face_tensor = mtcnn(rgb)
@@ -205,12 +213,51 @@ def _embedding_from_crop(face_crop_cv2):
         with torch.no_grad():
             return face_net(face_tensor.unsqueeze(0).to(device))
 
+    # Reintento con upscale — caras pequeñas (foto del documento)
+    h, w = rgb.shape[:2]
+    if min(h, w) < 100:
+        factor = min(4.0, 160 / max(min(h, w), 1))
+        up_rgb = cv2.resize(rgb, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
+        face_tensor = mtcnn(up_rgb)
+        if face_tensor is not None:
+            with torch.no_grad():
+                return face_net(face_tensor.unsqueeze(0).to(device))
+
     # Fallback: redimensionar el recorte directamente a 160×160
     small  = cv2.resize(rgb, (160, 160))
     tensor = torch.from_numpy(small).permute(2, 0, 1).float() / 255.0
     tensor = (tensor - 0.5) / 0.25
     with torch.no_grad():
         return face_net(tensor.unsqueeze(0).to(device))
+
+
+def _try_mtcnn(rgb, prob_threshold: float):
+    """
+    Ejecuta MTCNN sobre una imagen RGB y devuelve la detección de mayor
+    probabilidad (box_raw, prob, points) si supera el umbral; si no, None.
+    """
+    try:
+        boxes, probs, points = mtcnn.detect(rgb, landmarks=True)
+        if boxes is None or len(boxes) == 0 or probs[0] is None:
+            return None
+        idx  = int(np.argmax(probs))
+        prob = float(probs[idx])
+        if prob < prob_threshold:
+            return None
+        return boxes[idx], prob, points[idx]
+    except Exception:
+        return None
+
+
+def _mtcnn_upscale_factor(min_dim: int) -> float:
+    """
+    Factor de upscale para caras pequeñas en el documento: apunta a una
+    dimensión mínima de ~900px (tope 3x) para que el rostro supere cómodamente
+    el min_face_size de MTCNN.
+    """
+    if min_dim >= 700:
+        return 1.0
+    return min(3.0, 900 / max(min_dim, 1))
 
 
 def extract_face_embedding(cv2_img):
@@ -224,7 +271,7 @@ def extract_face_embedding(cv2_img):
         landmarks     : lista de 5 puntos [{x,y}, ...] o None
 
     Orden de intentos:
-      1. MTCNN detect() → bounding box + landmarks + recorte mejorado con padding
+      1. MTCNN detect() multi-escala → bounding box + landmarks + recorte con padding
       2. Haar cascade   → bounding box + recorte mejorado
       3. Imagen completa como último recurso
     """
@@ -233,74 +280,96 @@ def extract_face_embedding(cv2_img):
 
     H, W  = cv2_img.shape[:2]
     rgb   = _cv2_to_rgb(cv2_img)
+    min_dim = min(H, W)
 
-    # ── Nivel 1: MTCNN con detección de box y landmarks ─────────────────────
-    try:
-        boxes, probs, points = mtcnn.detect(rgb, landmarks=True)
+    # ── Nivel 1: MTCNN multi-escala ──────────────────────────────────────────
+    mtcnn_hit = _try_mtcnn(rgb, prob_threshold=0.90)
+    img_scale = 1.0
 
-        if boxes is not None and len(boxes) > 0 and probs[0] is not None:
-            # Tomar la detección de mayor probabilidad
-            best_idx = int(np.argmax(probs))
-            box_raw  = boxes[best_idx]      # [x1, y1, x2, y2]
-            prob     = float(probs[best_idx])
+    # Intento B — upscale si la imagen es chica (cara pequeña en el documento)
+    if mtcnn_hit is None and min_dim < 700:
+        img_scale = _mtcnn_upscale_factor(min_dim)
+        up_img    = cv2.resize(cv2_img, None, fx=img_scale, fy=img_scale, interpolation=cv2.INTER_CUBIC)
+        mtcnn_hit = _try_mtcnn(_cv2_to_rgb(up_img), prob_threshold=0.90)
+        if mtcnn_hit is None:
+            img_scale = 1.0
 
-            if prob >= 0.90:
-                x1, y1, x2, y2 = [int(v) for v in box_raw]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(W, x2), min(H, y2)
+    # Intento C — tolerar menor probabilidad (brillo, glare, oclusión parcial)
+    if mtcnn_hit is None:
+        mtcnn_hit = _try_mtcnn(rgb, prob_threshold=0.60)
+        if mtcnn_hit is not None:
+            logger.info("[FACE] MTCNN low-prob hit on original (prob=%.2f)", mtcnn_hit[1])
 
-                box = {
-                    "x": x1, "y": y1,
-                    "w": x2 - x1, "h": y2 - y1,
-                    # Coordenadas normalizadas 0-1 para el frontend
-                    "x_norm": round(x1 / W, 4),
-                    "y_norm": round(y1 / H, 4),
-                    "w_norm": round((x2 - x1) / W, 4),
-                    "h_norm": round((y2 - y1) / H, 4),
-                    "prob":   round(prob, 3),
-                    "method": "mtcnn",
-                }
+    if mtcnn_hit is None and min_dim < 700:
+        factor = _mtcnn_upscale_factor(min_dim)
+        up_img = cv2.resize(cv2_img, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
+        low_hit = _try_mtcnn(_cv2_to_rgb(up_img), prob_threshold=0.60)
+        if low_hit is not None:
+            mtcnn_hit = low_hit
+            img_scale = factor
+            logger.info("[FACE] MTCNN low-prob hit on upscale (prob=%.2f)", low_hit[1])
 
-                # Landmarks: array (N, 5, 2) → lista de 5 puntos {x, y, x_norm, y_norm}
-                lm_raw   = points[best_idx]   # shape (5, 2): ojos, nariz, comisuras boca
-                lm_names = ["eye_left", "eye_right", "nose", "mouth_left", "mouth_right"]
-                landmarks = [
-                    {
-                        "name":   lm_names[i],
-                        "x":      int(lm_raw[i][0]),
-                        "y":      int(lm_raw[i][1]),
-                        "x_norm": round(float(lm_raw[i][0]) / W, 4),
-                        "y_norm": round(float(lm_raw[i][1]) / H, 4),
-                    }
-                    for i in range(5)
-                ]
+    if mtcnn_hit is not None:
+        box_raw, prob, points = mtcnn_hit
+        if img_scale != 1.0:
+            box_raw = box_raw / img_scale
+            points  = points  / img_scale
 
-                # Recortar con padding y generar embedding de mayor calidad
-                face_crop = _crop_face_from_box(cv2_img, x1, y1, x2 - x1, y2 - y1, padding_ratio=0.15)
-                emb       = _embedding_from_crop(face_crop)
-                logger.info("[FACE] MTCNN box=[%d,%d,%d,%d] prob=%.2f", x1, y1, x2, y2, prob)
-                return emb, True, box, landmarks
+        x1, y1, x2, y2 = [int(v) for v in box_raw]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(W, x2), min(H, y2)
 
-    except Exception as e:
-        logger.warning("[FACE] MTCNN detect() failed: %s — falling back to Haar", str(e))
+        box = {
+            "x": x1, "y": y1,
+            "w": x2 - x1, "h": y2 - y1,
+            # Coordenadas normalizadas 0-1 para el frontend
+            "x_norm": round(x1 / W, 4),
+            "y_norm": round(y1 / H, 4),
+            "w_norm": round((x2 - x1) / W, 4),
+            "h_norm": round((y2 - y1) / H, 4),
+            "prob":   round(prob, 3),
+            "method": "mtcnn",
+        }
 
-    # ── Nivel 2: Haar cascade ────────────────────────────────────────────────
+        # Landmarks: array (5, 2) → lista de 5 puntos {x, y, x_norm, y_norm}
+        lm_raw   = points   # shape (5, 2): ojos, nariz, comisuras boca
+        lm_names = ["eye_left", "eye_right", "nose", "mouth_left", "mouth_right"]
+        landmarks = [
+            {
+                "name":   lm_names[i],
+                "x":      int(lm_raw[i][0]),
+                "y":      int(lm_raw[i][1]),
+                "x_norm": round(float(lm_raw[i][0]) / W, 4),
+                "y_norm": round(float(lm_raw[i][1]) / H, 4),
+            }
+            for i in range(5)
+        ]
+
+        # Recortar con padding y generar embedding de mayor calidad
+        face_crop = _crop_face_from_box(cv2_img, x1, y1, x2 - x1, y2 - y1, padding_ratio=0.15)
+        emb       = _embedding_from_crop(face_crop)
+        logger.info("[FACE] MTCNN box=[%d,%d,%d,%d] prob=%.2f scale=%.2f", x1, y1, x2, y2, prob, img_scale)
+        return emb, True, box, landmarks
+
+    # ── Nivel 2: Haar cascade (con filtro de tamaño mínimo) ──────────────────
     haar_result = _haar_detect_box(cv2_img)
     if haar_result is not None:
         x, y, w, h = haar_result
-        box = {
-            "x": x, "y": y, "w": w, "h": h,
-            "x_norm": round(x / W, 4),
-            "y_norm": round(y / H, 4),
-            "w_norm": round(w / W, 4),
-            "h_norm": round(h / H, 4),
-            "prob":   0.70,
-            "method": "haar",
-        }
-        face_crop = _crop_face_from_box(cv2_img, x, y, w, h, padding_ratio=0.15)
-        emb       = _embedding_from_crop(face_crop)
-        logger.info("[FACE] Haar box=[%d,%d,%d,%d]", x, y, w, h)
-        return emb, True, box, None
+        # Descartar cajas diminutas típicamente falsos positivos sobre texto
+        if w >= 24 and h >= 24:
+            box = {
+                "x": x, "y": y, "w": w, "h": h,
+                "x_norm": round(x / W, 4),
+                "y_norm": round(y / H, 4),
+                "w_norm": round(w / W, 4),
+                "h_norm": round(h / H, 4),
+                "prob":   0.70,
+                "method": "haar",
+            }
+            face_crop = _crop_face_from_box(cv2_img, x, y, w, h, padding_ratio=0.15)
+            emb       = _embedding_from_crop(face_crop)
+            logger.info("[FACE] Haar box=[%d,%d,%d,%d]", x, y, w, h)
+            return emb, True, box, None
 
     # ── Nivel 3: imagen completa como último recurso ─────────────────────────
     small  = cv2.resize(rgb, (160, 160))
@@ -310,14 +379,6 @@ def extract_face_embedding(cv2_img):
         emb = face_net(tensor.unsqueeze(0).to(device))
     logger.info("[FACE] Fallback: full-image embedding (no face detected)")
     return emb, False, None, None
-
-    # Nivel 3: imagen completa como último recurso
-    small  = cv2.resize(rgb, (160, 160))
-    tensor = torch.from_numpy(small).permute(2, 0, 1).float() / 255.0
-    tensor = (tensor - 0.5) / 0.25
-    with torch.no_grad():
-        emb = face_net(tensor.unsqueeze(0).to(device))
-    return emb, False
 
 
 def _cosine_sim_pct(emb_a, emb_b) -> float:
@@ -338,12 +399,21 @@ def calculate_similarity(img1, img2):
         selfie_landmarks: lista de 5 landmarks de la selfie (o None)
         id_box          : dict con bounding box del documento (o None)
         id_landmarks    : lista de 5 landmarks del documento (o None)
+        selfie_embedding: lista de 512 floats del embedding de la selfie (o None)
+        id_embedding    : lista de 512 floats del embedding del documento (o None)
     """
-    emb1, ok1, box1, lm1 = extract_face_embedding(img1)
-    emb2, ok2, box2, lm2 = extract_face_embedding(img2)
+    # Fase 4 — las detecciones faciales usan GPU (MTCNN + FaceNet): serializar
+    with _GPU_LOCK:
+        emb1, ok1, box1, lm1 = extract_face_embedding(img1)
+        emb2, ok2, box2, lm2 = extract_face_embedding(img2)
+
+    def _to_list(emb) -> Optional[list]:
+        if emb is None:
+            return None
+        return [round(float(v), 6) for v in emb.squeeze().detach().cpu().tolist()]
 
     if emb1 is None or emb2 is None:
-        return None, "none", False, "failed", None, None, None, None
+        return None, "none", False, "failed", None, None, None, None, None, None
 
     if ok1 and ok2:
         state   = "both"
@@ -365,7 +435,7 @@ def calculate_similarity(img1, img2):
     else:
         is_match = sim_pct >= FACE_THRESHOLD_ONE
 
-    return sim_pct, state, is_match, quality, box1, lm1, box2, lm2
+    return sim_pct, state, is_match, quality, box1, lm1, box2, lm2, _to_list(emb1), _to_list(emb2)
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +688,9 @@ def field_text_matches_smart(field: str, expected_value: str, extracted_text: st
 
 
 def extract_document_text(reader, img) -> str:
-    results   = reader.readtext(img, detail=1)
+    # Fase 4 — EasyOCR usa GPU: serializar contra las detecciones faciales
+    with _GPU_LOCK:
+        results = reader.readtext(img, detail=1)
     lines     = [normalize_text(text) for _, text, conf in results if conf >= OCR_MIN_CONFIDENCE]
     full_text = " ".join(lines)
     logger.info("[OCR] Texto extraído: %s", full_text)
@@ -673,7 +745,8 @@ def verify_identity(data: VerificationRequest):
 
         # ── Similitud facial con threshold dinámico (Opción A) ──────────
         similarity_pct, face_state, is_same_person, face_quality, \
-            selfie_box, selfie_landmarks, id_box, id_landmarks = calculate_similarity(
+            selfie_box, selfie_landmarks, id_box, id_landmarks, \
+            selfie_embedding, id_embedding = calculate_similarity(
             selfie_img, id_img
         )
 
@@ -754,6 +827,11 @@ def verify_identity(data: VerificationRequest):
             "selfie_face_landmarks": selfie_landmarks,
             "id_face_box":           id_box,
             "id_face_landmarks":     id_landmarks,
+
+            # ── Embeddings faciales (Fase 3 — antifraude entre solicitudes)
+            # Se reenvían al backend IA para comparar contra análisis previos.
+            "selfie_embedding":      selfie_embedding,
+            "id_embedding":          id_embedding,
 
             # ── Fraude selfie = documento (Opción C) ─────────────────────
             "is_selfie_fraud":       is_selfie_fraud,
