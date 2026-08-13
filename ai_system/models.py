@@ -13,16 +13,31 @@ class AIAnalysis:
     extracted_data: Dict[str, Any] = field(default_factory=dict)
     overall_confidence: float = 0.0
     reasoning: str = ""
-    
+
+    # Opción D — Análisis facial por IA (llava:7b)
+    face_match_score: float = -1.0          # 0-100, -1 = no ejecutado
+    face_match_issues: List[str] = field(default_factory=list)
+    face_match_reasoning: str = ""
+
+    # Opción B — Estado del dorso analizado por IA
+    back_analysis_score: float = -1.0       # 0-100, -1 = no ejecutado
+    back_analysis_issues: List[str] = field(default_factory=list)
+
     def to_dict(self) -> dict:
         return {
-            "coherence_score": self.coherence_score,
-            "coherence_issues": self.coherence_issues,
-            "tampering_score": self.tampering_score,
-            "tampering_areas": self.tampering_areas,
-            "extracted_data": self.extracted_data,
-            "overall_confidence": self.overall_confidence,
-            "reasoning": self.reasoning
+            "coherence_score":      self.coherence_score,
+            "coherence_issues":     self.coherence_issues,
+            "tampering_score":      self.tampering_score,
+            "tampering_areas":      self.tampering_areas,
+            "extracted_data":       self.extracted_data,
+            "overall_confidence":   self.overall_confidence,
+            "reasoning":            self.reasoning,
+            # Campos nuevos
+            "face_match_score":     self.face_match_score,
+            "face_match_issues":    self.face_match_issues,
+            "face_match_reasoning": self.face_match_reasoning,
+            "back_analysis_score":  self.back_analysis_score,
+            "back_analysis_issues": self.back_analysis_issues,
         }
 
 

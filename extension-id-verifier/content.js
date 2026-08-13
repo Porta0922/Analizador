@@ -313,57 +313,144 @@ function clearHighlight() {
   document.querySelectorAll(".selfie-debug-box, .id-debug-box, .idback-debug-box").forEach((el) => el.remove());
 }
 
+// ---------------------------------------------------------------------------
+// Helpers para construir alertas inline dentro del badge
+// ---------------------------------------------------------------------------
+
+function _makeAlert(text, color, icon) {
+  const el = document.createElement("div");
+  el.style.cssText =
+    `display:flex;align-items:flex-start;gap:5px;` +
+    `background:rgba(${color},0.15);border-left:3px solid rgb(${color});` +
+    `padding:4px 6px;border-radius:0 4px 4px 0;margin-bottom:4px;font-size:10px;color:#fff;`;
+  el.innerHTML = `<span style="flex-shrink:0">${icon}</span><span>${text}</span>`;
+  return el;
+}
+
 function renderResults(res) {
   clearFeedback();
 
-  const selfieImg = debugSelection.selfieImg || currentSelfieImg();
-  const idImg = debugSelection.idImg;
-  const idBackImg = debugSelection.idBackImg;
+  // ── Determinar color general del header ───────────────────────────────────
+  // La verificación es negativa si: personas distintas, fraude detectado,
+  // ningún rostro detectado, o dorso = frente.
+  const hasCriticalAlert =
+    !res.is_same_person ||
+    res.is_selfie_fraud ||
+    res.face_detected === "none" ||
+    res.back_document_status === "same_as_front";
 
-  const warning =
-    res.face_detected && res.face_detected !== "both"
-      ? ` (rostro detectado solo en ${res.face_detected === "none" ? "ninguna" : res.face_detected})`
-      : "";
-
-  // Create fixed badge at bottom of screen
   const badge = document.createElement("div");
   badge.id = "selfie-similarity-badge";
   badge.style.cssText =
     "position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:999999;" +
-    "background:rgba(0,0,0,0.9);color:#fff;padding:12px 16px;border-radius:8px;" +
-    "font:13px/20px monospace;min-width:320px;box-shadow:0 4px 12px rgba(0,0,0,0.4);";
+    "background:rgba(10,10,15,0.96);color:#fff;padding:12px 16px;border-radius:8px;" +
+    "font:13px/20px monospace;min-width:340px;max-width:420px;" +
+    "box-shadow:0 4px 16px rgba(0,0,0,0.5);";
 
-  // Header with status
+  // ── Header: similitud + estado general ───────────────────────────────────
   const header = document.createElement("div");
   header.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:8px;";
+
+  const dotColor = hasCriticalAlert ? "#f44336" : (res.is_same_person ? "#4caf50" : "#ff9800");
   const statusDot = document.createElement("span");
-  statusDot.style.cssText = `width:10px;height:10px;border-radius:50%;background:${res.is_same_person ? "#4caf50" : "#f44336"};flex-shrink:0;`;
+  statusDot.style.cssText = `width:10px;height:10px;border-radius:50%;background:${dotColor};flex-shrink:0;`;
+
   const headerText = document.createElement("span");
   headerText.style.cssText = "font-weight:bold;font-size:14px;";
-  headerText.textContent = `Similitud: ${res.facial_similarity}%${warning}`;
+  const simLabel = res.facial_similarity != null ? `${res.facial_similarity}%` : "N/A";
+  headerText.textContent = `Similitud: ${simLabel}`;
+  if (res.face_threshold_used != null) {
+    const threshSpan = document.createElement("span");
+    threshSpan.style.cssText = "font-size:10px;color:#888;margin-left:6px;font-weight:normal;";
+    threshSpan.textContent = `(umbral: ${res.face_threshold_used}%)`;
+    headerText.appendChild(threshSpan);
+  }
+
   header.appendChild(statusDot);
   header.appendChild(headerText);
   badge.appendChild(header);
 
-  // Document duplicate info
-  if (res.is_document_duplicate) {
-    const dupInfo = document.createElement("div");
-    dupInfo.style.cssText = "color:#ff9800;font-size:11px;margin-bottom:4px;";
-    dupInfo.textContent = `DOC DUPLICADOS: ${res.document_duplicate_similarity}%`;
-    badge.appendChild(dupInfo);
+  // ── Alertas críticas (Opciones A, B, C) ──────────────────────────────────
+
+  // [Opción C] Fraude: selfie = documento
+  if (res.is_selfie_fraud) {
+    badge.appendChild(_makeAlert(
+      `⚠️ FRAUDE DETECTADO: La selfie y el documento son la misma imagen (similitud ${res.selfie_doc_similarity}%). ` +
+      "Por favor verificar manualmente.",
+      "220,53,69", "🚨"
+    ));
   }
 
-  // Field matches summary
+  // [Opción A] Ningún rostro detectado → resultado no confiable
+  if (res.face_detected === "none") {
+    badge.appendChild(_makeAlert(
+      "No se detectó ningún rostro en las imágenes. El resultado de similitud facial NO es confiable. " +
+      "Verificar que la selfie y la foto del documento sean correctas.",
+      "220,53,69", "👤"
+    ));
+  } else if (res.face_detected === "selfie") {
+    // Solo detectó en selfie → embedding del doc es de baja calidad
+    badge.appendChild(_makeAlert(
+      `Rostro detectado solo en la selfie. La foto del documento no tiene un rostro claro. ` +
+      `Resultado: ${res.facial_similarity}% (umbral reducido: ${res.face_threshold_used}%).`,
+      "255,152,0", "⚠️"
+    ));
+  } else if (res.face_detected === "id") {
+    badge.appendChild(_makeAlert(
+      `Rostro detectado solo en el documento. La selfie no tiene un rostro claro. ` +
+      `Resultado: ${res.facial_similarity}% (umbral reducido: ${res.face_threshold_used}%).`,
+      "255,152,0", "⚠️"
+    ));
+  }
+
+  // [Opción B] Estado del dorso
+  if (res.back_document_status === "same_as_front") {
+    badge.appendChild(_makeAlert(
+      `El dorso del documento es idéntico al frente (similitud ${res.back_similarity}%). ` +
+      "Se subió la misma imagen dos veces. Solicitar el dorso correcto.",
+      "220,53,69", "📄"
+    ));
+  } else if (res.back_document_status === "duplicate") {
+    badge.appendChild(_makeAlert(
+      `Frente y dorso del documento son muy similares (${res.back_similarity}%). ` +
+      "Posible error al subir las imágenes.",
+      "255,152,0", "📄"
+    ));
+  } else if (res.back_document_status === "decode_error") {
+    badge.appendChild(_makeAlert(
+      "No se pudo procesar la imagen del dorso del documento.",
+      "255,152,0", "⚠️"
+    ));
+  }
+
+  // [Opción A] Calidad de detección cuando ambas están presentes — solo info
+  if (res.face_quality === "high" && res.is_same_person) {
+    // Todo ok — no mostrar nada extra
+  }
+
+  // ── Resultado facial ──────────────────────────────────────────────────────
+  const faceResult = document.createElement("div");
+  faceResult.style.cssText =
+    `font-size:11px;padding:4px 0;` +
+    `color:${res.is_same_person ? "#4caf50" : "#f44336"};`;
+  faceResult.textContent = res.is_same_person
+    ? "✓ Coincidencia facial confirmada"
+    : "✗ Coincidencia facial negativa";
+  badge.appendChild(faceResult);
+
+  // ── Campos del formulario ─────────────────────────────────────────────────
   const fieldSummary = document.createElement("div");
-  fieldSummary.style.cssText = "font-size:11px;color:#aaa;border-top:1px solid rgba(255,255,255,0.2);padding-top:6px;margin-top:4px;";
-  const matches = Object.entries(res.field_matches || {});
+  fieldSummary.style.cssText =
+    "font-size:11px;color:#aaa;border-top:1px solid rgba(255,255,255,0.15);" +
+    "padding-top:6px;margin-top:4px;";
+  const matches    = Object.entries(res.field_matches || {});
   const matchCount = matches.filter(([, v]) => v).length;
   fieldSummary.textContent = `Campos: ${matchCount}/${matches.length} coinciden`;
   badge.appendChild(fieldSummary);
 
   document.body.appendChild(badge);
 
-  // Highlight inputs
+  // ── Resaltar inputs del formulario ────────────────────────────────────────
   for (const [key, isMatch] of Object.entries(res.field_matches || {})) {
     const input = findInputByFieldKey(key);
     if (input) {
@@ -377,69 +464,145 @@ function renderAIResults(aiResult) {
   const badge = document.getElementById("selfie-similarity-badge");
   if (!badge || !aiResult || !aiResult.result) return;
 
-  const result = aiResult.result;
+  const result      = aiResult.result;
   const shouldReject = aiResult.should_reject;
 
-  // Create AI section
   const aiDiv = document.createElement("div");
   aiDiv.id = "ai-analysis-section";
-  aiDiv.style.cssText = "margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.3);";
+  aiDiv.style.cssText =
+    "margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.3);";
 
-  // AI Header
+  // ── Header IA ─────────────────────────────────────────────────────────────
   const header = document.createElement("div");
-  header.style.cssText = "font-weight: bold; margin-bottom: 4px; color: " + (shouldReject ? "#f44336" : "#4caf50") + ";";
+  header.style.cssText =
+    "font-weight:bold;margin-bottom:5px;color:" + (shouldReject ? "#f44336" : "#4caf50") + ";";
   header.textContent = shouldReject ? "IA: RECHAZADO" : "IA: APROBADO";
   aiDiv.appendChild(header);
 
-  // Scores
+  // ── Scores base ───────────────────────────────────────────────────────────
   const scores = document.createElement("div");
-  scores.style.cssText = "font-size: 10px; color: #ccc;";
-  scores.innerHTML =
-    `Coherencia: ${result.coherence_score}% | Integridad: ${result.tampering_score}% | Confianza: ${result.overall_confidence}%`;
+  scores.style.cssText = "font-size:10px;color:#ccc;margin-bottom:4px;";
+  scores.textContent =
+    `Coherencia: ${result.coherence_score}% | ` +
+    `Integridad: ${result.tampering_score}% | ` +
+    `Confianza: ${result.overall_confidence}%`;
   aiDiv.appendChild(scores);
 
-  // Issues if any
+  // ── Opción D: Face match por IA ───────────────────────────────────────────
+  if (result.face_match_score != null && result.face_match_score >= 0) {
+    const fmScore  = result.face_match_score;
+    const fmOk     = fmScore >= 60;
+    const fmColor  = fmOk ? "#4caf50" : "#f44336";
+    const fmBg     = fmOk ? "rgba(76,175,80,0.12)" : "rgba(244,67,54,0.12)";
+    const fmBorder = fmOk ? "#4caf50" : "#f44336";
+
+    const fmDiv = document.createElement("div");
+    fmDiv.style.cssText =
+      `background:${fmBg};border-left:3px solid ${fmBorder};` +
+      `padding:4px 6px;border-radius:0 4px 4px 0;margin-bottom:4px;`;
+
+    const fmTitle = document.createElement("div");
+    fmTitle.style.cssText = `font-size:10px;font-weight:bold;color:${fmColor};margin-bottom:2px;`;
+    fmTitle.textContent = `${fmOk ? "✓" : "✗"} IA Facial: ${fmScore}% de coincidencia`;
+    fmDiv.appendChild(fmTitle);
+
+    if (result.face_match_reasoning) {
+      const fmReason = document.createElement("div");
+      fmReason.style.cssText = "font-size:9px;color:#bbb;line-height:1.3;";
+      fmReason.textContent = result.face_match_reasoning;
+      fmDiv.appendChild(fmReason);
+    }
+
+    if (result.face_match_issues && result.face_match_issues.length > 0) {
+      const fmIssues = document.createElement("div");
+      fmIssues.style.cssText = "font-size:9px;color:#ff9800;margin-top:2px;";
+      fmIssues.textContent = "⚠ " + result.face_match_issues.join(" · ");
+      fmDiv.appendChild(fmIssues);
+    }
+
+    aiDiv.appendChild(fmDiv);
+  }
+
+  // ── Opción D: Verificación del dorso por IA ───────────────────────────────
+  if (result.back_analysis_score != null && result.back_analysis_score >= 0) {
+    const bScore  = result.back_analysis_score;
+    const isBack  = bScore >= 50;
+    const bColor  = isBack ? "#4caf50" : "#f44336";
+    const bBg     = isBack ? "rgba(76,175,80,0.12)" : "rgba(244,67,54,0.12)";
+
+    const bDiv = document.createElement("div");
+    bDiv.style.cssText =
+      `background:${bBg};border-left:3px solid ${bColor};` +
+      `padding:4px 6px;border-radius:0 4px 4px 0;margin-bottom:4px;`;
+
+    const bTitle = document.createElement("div");
+    bTitle.style.cssText = `font-size:10px;font-weight:bold;color:${bColor};margin-bottom:2px;`;
+    bTitle.textContent = isBack
+      ? `✓ Dorso verificado por IA (${bScore}%)`
+      : `✗ IA: la imagen del dorso no parece ser el reverso del documento (${bScore}%)`;
+    bDiv.appendChild(bTitle);
+
+    if (!isBack) {
+      const bWarn = document.createElement("div");
+      bWarn.style.cssText = "font-size:9px;color:#ff9800;margin-top:2px;";
+      bWarn.textContent = "Posiblemente se subió el frente del documento dos veces.";
+      bDiv.appendChild(bWarn);
+    }
+
+    if (result.back_analysis_issues && result.back_analysis_issues.length > 0) {
+      const bIssues = document.createElement("div");
+      bIssues.style.cssText = "font-size:9px;color:#ff9800;margin-top:2px;";
+      bIssues.textContent = "⚠ " + result.back_analysis_issues.join(" · ");
+      bDiv.appendChild(bIssues);
+    }
+
+    aiDiv.appendChild(bDiv);
+  }
+
+  // ── Problemas de coherencia ───────────────────────────────────────────────
   if (result.coherence_issues && result.coherence_issues.length > 0) {
     const issues = document.createElement("div");
-    issues.style.cssText = "font-size: 10px; color: #ff9800; margin-top: 4px;";
-    const issueList = result.coherence_issues.map(i => typeof i === "object" ? (i.reason || i.message || JSON.stringify(i)) : i);
+    issues.style.cssText = "font-size:10px;color:#ff9800;margin-top:3px;";
+    const issueList = result.coherence_issues.map(
+      (i) => (typeof i === "object" ? i.reason || i.message || JSON.stringify(i) : i)
+    );
     issues.textContent = "Problemas: " + issueList.join(", ");
     aiDiv.appendChild(issues);
   }
 
-  // Tampering areas if any
+  // ── Áreas sospechosas (tampering) ────────────────────────────────────────
   if (result.tampering_areas && result.tampering_areas.length > 0) {
     const areas = document.createElement("div");
-    areas.style.cssText = "font-size: 10px; color: #ff9800; margin-top: 2px;";
-    const areaList = result.tampering_areas.map(a => typeof a === "object" ? (a.area || a.reason || JSON.stringify(a)) : a);
+    areas.style.cssText = "font-size:10px;color:#ff9800;margin-top:2px;";
+    const areaList = result.tampering_areas.map(
+      (a) => (typeof a === "object" ? a.area || a.reason || JSON.stringify(a) : a)
+    );
     areas.textContent = "Áreas sospechosas: " + areaList.join(", ");
     aiDiv.appendChild(areas);
   }
 
-  // Feedback buttons
+  // ── Botones de feedback ───────────────────────────────────────────────────
   const btnContainer = document.createElement("div");
-  btnContainer.style.cssText = "display: flex; gap: 4px; margin-top: 6px;";
+  btnContainer.style.cssText = "display:flex;gap:4px;margin-top:7px;";
 
   const confirmBtn = document.createElement("button");
   confirmBtn.textContent = "✓ IA Correcta";
   confirmBtn.style.cssText =
-    "background: #28a745; color: white; border: none; padding: 3px 6px; " +
-    "border-radius: 3px; cursor: pointer; font-size: 10px; flex: 1;";
+    "background:#28a745;color:white;border:none;padding:3px 6px;" +
+    "border-radius:3px;cursor:pointer;font-size:10px;flex:1;";
   confirmBtn.onclick = async () => {
     confirmBtn.disabled = true;
     confirmBtn.textContent = "Enviando...";
     await submitAIFeedback(aiResult.analysis_id, true);
-    showThankYou(badge, "Feedback enviado. Gracias!");
+    showThankYou(badge, "Feedback enviado. ¡Gracias!");
   };
 
   const rejectBtn = document.createElement("button");
   rejectBtn.textContent = "✗ IA Incorrecta";
   rejectBtn.style.cssText =
-    "background: #dc3545; color: white; border: none; padding: 3px 6px; " +
-    "border-radius: 3px; cursor: pointer; font-size: 10px; flex: 1;";
-  rejectBtn.onclick = () => {
-    showCorrectionForm(badge, aiResult);
-  };
+    "background:#dc3545;color:white;border:none;padding:3px 6px;" +
+    "border-radius:3px;cursor:pointer;font-size:10px;flex:1;";
+  rejectBtn.onclick = () => showCorrectionForm(badge, aiResult);
 
   btnContainer.appendChild(confirmBtn);
   btnContainer.appendChild(rejectBtn);

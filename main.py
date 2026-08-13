@@ -18,20 +18,49 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("id-verifier")
 
 # ---------------------------------------------------------------------------
-# Configuración por variables de entorno (con defaults seguros para desarrollo)
+# Configuración por variables de entorno
 # ---------------------------------------------------------------------------
-MAX_IMAGE_B64_LENGTH = int(os.getenv("MAX_IMAGE_B64_LENGTH", "15_000_000"))
-MAX_FORM_FIELDS = int(os.getenv("MAX_FORM_FIELDS", "20"))
-MAX_FIELD_VALUE_LENGTH = int(os.getenv("MAX_FIELD_VALUE_LENGTH", "200"))
-OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "0.4"))
-FACE_SIMILARITY_THRESHOLD = float(os.getenv("FACE_SIMILARITY_THRESHOLD", "60.0"))
+MAX_IMAGE_B64_LENGTH    = int(os.getenv("MAX_IMAGE_B64_LENGTH",   "15_000_000"))
+MAX_FORM_FIELDS         = int(os.getenv("MAX_FORM_FIELDS",        "20"))
+MAX_FIELD_VALUE_LENGTH  = int(os.getenv("MAX_FIELD_VALUE_LENGTH", "200"))
+OCR_MIN_CONFIDENCE      = float(os.getenv("OCR_MIN_CONFIDENCE",   "0.4"))
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv("CORS_ORIGINS", "*").split(",")
     if origin.strip()
 ]
 
-app = FastAPI(title="Verificación de Identidad Local GPU", version="3.0")
+# ---------------------------------------------------------------------------
+# Opciones A — Thresholds faciales dinámicos por calidad de detección
+# ---------------------------------------------------------------------------
+# "both"   → ambas caras detectadas correctamente — exigente
+# "one"    → solo una cara detectada              — tolerante
+# "none"   → ninguna cara detectada               → RECHAZO automático
+
+FACE_THRESHOLD_BOTH  = float(os.getenv("FACE_THRESHOLD_BOTH",  "65.0"))
+FACE_THRESHOLD_ONE   = float(os.getenv("FACE_THRESHOLD_ONE",   "55.0"))
+
+# Opción C — Si selfie y documento superan este umbral de similitud entre
+# ellos → probable fraude (misma imagen subida dos veces)
+SELFIE_DOC_FRAUD_THRESHOLD = float(os.getenv("SELFIE_DOC_FRAUD_THRESHOLD", "92.0"))
+
+# Compatibilidad hacia atrás: FACE_SIMILARITY_THRESHOLD se mantiene como alias
+# para el umbral "both". Si alguien ya lo tiene configurado en el entorno,
+# se usa como base para ambos thresholds.
+_legacy = float(os.getenv("FACE_SIMILARITY_THRESHOLD", "0"))
+if _legacy > 0:
+    FACE_THRESHOLD_BOTH = _legacy
+    FACE_THRESHOLD_ONE  = max(45.0, _legacy - 10.0)
+
+# ---------------------------------------------------------------------------
+# Opciones B — Estados del dorso del documento
+# ---------------------------------------------------------------------------
+# "ok"          → dorso provisto y diferente al frente
+# "same_as_front" → dorso idéntico o casi idéntico al frente (posible error)
+# "duplicate"   → frente y dorso superan umbral genérico de duplicados (≥70%)
+BACK_IDENTICAL_THRESHOLD = float(os.getenv("BACK_IDENTICAL_THRESHOLD", "92.0"))
+
+app = FastAPI(title="Verificación de Identidad Local GPU", version="4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,17 +70,16 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Inicialización de modelos (una sola vez)
+# Inicialización de modelos (una sola vez al arrancar)
 # ---------------------------------------------------------------------------
 use_gpu = os.getenv("USE_GPU", "").lower() not in ("0", "false", "no") and torch.cuda.is_available()
-device = torch.device("cuda:0" if use_gpu else "cpu")
+device  = torch.device("cuda:0" if use_gpu else "cpu")
 logger.info("--> Ejecutando backend en: %s", device)
 if use_gpu:
     logger.info("--> GPU detectada: %s", torch.cuda.get_device_name(0))
 
 ocr_reader = easyocr.Reader(["es"], gpu=use_gpu)
 
-# MTCNN: detección + recorte + alineación de rostros
 mtcnn = MTCNN(
     keep_all=False,
     device=device,
@@ -60,22 +88,20 @@ mtcnn = MTCNN(
     post_process=True,
 )
 
-# InceptionResnetV1: embeddings faciales pre-entrenados en VGGFace2
 face_net = InceptionResnetV1(pretrained="vggface2").eval().to(device)
 
-# Haar cascade como fallback para fotos de cédula muy pequeñas
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
 # ---------------------------------------------------------------------------
-# Validación de entrada
+# Modelos de petición
 # ---------------------------------------------------------------------------
 class VerificationRequest(BaseModel):
-    selfie_b64: str = Field(min_length=1, max_length=MAX_IMAGE_B64_LENGTH)
-    id_card_b64: str = Field(min_length=1, max_length=MAX_IMAGE_B64_LENGTH)
-    id_card_back_b64: str = Field(default="", max_length=MAX_IMAGE_B64_LENGTH)
-    form_data: dict = Field(default_factory=dict, max_length=MAX_FORM_FIELDS)
+    selfie_b64:       str  = Field(min_length=1, max_length=MAX_IMAGE_B64_LENGTH)
+    id_card_b64:      str  = Field(min_length=1, max_length=MAX_IMAGE_B64_LENGTH)
+    id_card_back_b64: str  = Field(default="",   max_length=MAX_IMAGE_B64_LENGTH)
+    form_data:        dict = Field(default_factory=dict, max_length=MAX_FORM_FIELDS)
 
     @field_validator("selfie_b64", "id_card_b64")
     @classmethod
@@ -101,50 +127,48 @@ class VerificationRequest(BaseModel):
                 raise ValueError(f"El campo '{key}' excede la longitud máxima.")
         return value
 
+
 # ---------------------------------------------------------------------------
-# Utilidades
+# Utilidades de imagen
 # ---------------------------------------------------------------------------
 def b64_to_cv2(b64_string: str):
-    """Decodifica un base64 (con o sin prefijo data URI) a imagen OpenCV."""
+    """Decodifica base64 (con o sin prefijo data URI) a imagen OpenCV BGR."""
     if "," in b64_string:
         b64_string = b64_string.split(",", 1)[1]
     img_bytes = base64.b64decode(b64_string, validate=True)
-    nparr = np.frombuffer(img_bytes, np.uint8)
+    nparr     = np.frombuffer(img_bytes, np.uint8)
     return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
 
 def normalize_text(text: str) -> str:
-    """Normaliza a mayúsculas conservando espacios entre palabras."""
     return re.sub(r"[^A-Z0-9\s]", " ", text.upper())
 
 
 # ---------------------------------------------------------------------------
-# Detección de rostro + embeddings faciales
+# Detección de rostro y embeddings
 # ---------------------------------------------------------------------------
 def _cv2_to_rgb(cv2_img):
     return cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
 
 
 def _haar_fallback_embedding(cv2_img):
-    """Fallback: usa Haar cascade para detectar rostro en fotos de cédula
-    muy pequeñas donde MTCNN no funciona, y genera un embedding aproximado."""
-    gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
+    """Haar cascade fallback para fotos de cédula pequeñas donde MTCNN falla."""
+    gray    = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
     min_dim = min(gray.shape)
     if min_dim < 200:
-        scale = max(2.0, round(300 / min_dim))
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        scale   = max(2.0, round(300 / min_dim))
+        gray    = cv2.resize(gray,    None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
         cv2_img = cv2.resize(cv2_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
 
     for g in (gray, cv2.equalizeHist(gray)):
         faces = face_cascade.detectMultiScale(g, scaleFactor=1.05, minNeighbors=3, minSize=(20, 20))
         if len(faces) > 0:
-            x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
-            face_roi = cv2_img[y:y + h, x:x + w]
-            # Resize to minimum 160x160 to avoid conv errors
-            face_roi = cv2.resize(face_roi, (160, 160), interpolation=cv2.INTER_LINEAR)
-            rgb = _cv2_to_rgb(face_roi)
-            tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-            tensor = (tensor - 0.5) / 0.25  # normalizar como VGGFace2
+            x, y, w, h  = max(faces, key=lambda r: r[2] * r[3])
+            face_roi     = cv2_img[y:y + h, x:x + w]
+            face_roi     = cv2.resize(face_roi, (160, 160), interpolation=cv2.INTER_LINEAR)
+            rgb          = _cv2_to_rgb(face_roi)
+            tensor       = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+            tensor       = (tensor - 0.5) / 0.25
             with torch.no_grad():
                 emb = face_net(tensor.unsqueeze(0).to(device))
             return emb, True
@@ -153,32 +177,30 @@ def _haar_fallback_embedding(cv2_img):
 
 
 def extract_face_embedding(cv2_img):
-    """Detecta rostro y extrae embedding facial.
-
-    Retorna (embedding_tensor, face_detected).
-    - MTCNN es preciso para selfies y fotos frontales.
-    - Haar cascade es fallback para fotos de cédula muy pequeñas.
-    - Si nada funciona, usa la imagen completa (menos confiable).
+    """
+    Detecta rostro y extrae embedding 512-dim.
+    Retorna (embedding, face_detected:bool).
+    face_detected=False indica embedding de baja confianza (imagen completa).
     """
     if cv2_img is None:
         return None, False
 
     rgb = _cv2_to_rgb(cv2_img)
 
-    # 1) Intentar con MTCNN (el más preciso)
+    # Nivel 1: MTCNN (más preciso)
     face_tensor = mtcnn(rgb)
     if face_tensor is not None:
         with torch.no_grad():
             emb = face_net(face_tensor.unsqueeze(0).to(device))
         return emb, True
 
-    # 2) Fallback: Haar cascade (fotos de cédula pequeñas)
+    # Nivel 2: Haar cascade (fotos pequeñas de cédula)
     emb, ok = _haar_fallback_embedding(cv2_img)
     if emb is not None:
         return emb, ok
 
-    # 3) Último recurso: embedding de la imagen completa (baja calidad)
-    small = cv2.resize(rgb, (160, 160))
+    # Nivel 3: imagen completa como último recurso
+    small  = cv2.resize(rgb, (160, 160))
     tensor = torch.from_numpy(small).permute(2, 0, 1).float() / 255.0
     tensor = (tensor - 0.5) / 0.25
     with torch.no_grad():
@@ -186,44 +208,67 @@ def extract_face_embedding(cv2_img):
     return emb, False
 
 
-def calculate_similarity(img1, img2):
-    """Calcula similitud facial usando embeddings de InceptionResnetV1.
+def _cosine_sim_pct(emb_a, emb_b) -> float:
+    """Similitud coseno entre dos embeddings, escalada a 0-100 y clipada a ≥0."""
+    return round(max(0.0, cosine_similarity(emb_a, emb_b).item()) * 100, 2)
 
-    Retorna (similitud_pct, face_state).
-    face_state: "both" | "selfie" | "id" | "none".
-    La similitud es la distancia coseno (-1 a 1) escalada a 0-100%.
-    Misma persona típicamente > 70%, diferente < 40%.
+
+def calculate_similarity(img1, img2):
+    """
+    Calcula similitud facial (selfie vs frente documento).
+
+    Retorna:
+        similarity_pct  : float 0-100 (None si fallo total)
+        face_state      : "both" | "selfie" | "id" | "none"
+        is_same_person  : bool — usa threshold dinámico según face_state
+        face_quality    : "high" | "degraded" | "failed"
     """
     emb1, ok1 = extract_face_embedding(img1)
     emb2, ok2 = extract_face_embedding(img2)
 
     if emb1 is None or emb2 is None:
-        return None, "none"
+        return None, "none", False, "failed"
 
-    state = "both" if (ok1 and ok2) else ("selfie" if ok1 else ("id" if ok2 else "none"))
+    if ok1 and ok2:
+        state   = "both"
+        quality = "high"
+    elif ok1 or ok2:
+        state   = "selfie" if ok1 else "id"
+        quality = "degraded"
+    else:
+        state   = "none"
+        quality = "failed"
 
-    sim = cosine_similarity(emb1, emb2).item()
-    similarity = max(0.0, sim) * 100
-    return round(similarity, 2), state
+    sim_pct = _cosine_sim_pct(emb1, emb2)
+
+    # Opción A — threshold dinámico
+    if state == "none":
+        # Ninguna cara detectada → rechazar independientemente del score
+        is_match = False
+    elif state == "both":
+        is_match = sim_pct >= FACE_THRESHOLD_BOTH
+    else:
+        is_match = sim_pct >= FACE_THRESHOLD_ONE
+
+    return sim_pct, state, is_match, quality
 
 
-def _average_hash(img, hash_size=16):
-    """Calcula el hash promedio (aHash) de una imagen."""
+# ---------------------------------------------------------------------------
+# Detección de documentos duplicados / dorso = frente
+# ---------------------------------------------------------------------------
+def _average_hash(img, hash_size: int = 16):
     resized = cv2.resize(img, (hash_size, hash_size))
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY) if len(resized.shape) == 3 else resized
-    mean = gray.mean()
-    bits = (gray > mean).flatten()
+    gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY) if len(resized.shape) == 3 else resized
+    bits    = (gray > gray.mean()).flatten()
     return bits
 
 
-def _hamming_distance(hash1, hash2):
-    """Distancia Hamming entre dos hashes."""
-    return int(np.sum(hash1 != hash2))
+def _hamming_distance(h1, h2) -> int:
+    return int(np.sum(h1 != h2))
 
 
-def _orb_similarity(img1, img2):
-    """Similitud por features ORB (keypoints matching)."""
-    orb = cv2.ORB_create(nfeatures=1000)
+def _orb_similarity(img1, img2) -> float:
+    orb   = cv2.ORB_create(nfeatures=1000)
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if len(img1.shape) == 3 else img1
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if len(img2.shape) == 3 else img2
 
@@ -233,66 +278,89 @@ def _orb_similarity(img1, img2):
     if des1 is None or des2 is None or len(kp1) < 2 or len(kp2) < 2:
         return 0.0
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    bf      = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     matches = bf.knnMatch(des1, des2, k=2)
-
-    # Lowe's ratio test
-    good = [m for m, n in matches if m.distance < 0.75 * n.distance]
-    total = min(len(kp1), len(kp2))
+    good    = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    total   = min(len(kp1), len(kp2))
     return (len(good) / total * 100) if total > 0 else 0.0
 
 
-def detect_duplicate_documents(img1, img2):
-    """Detecta si dos imágenes del documento son iguales o muy similares.
-    Combina aHash + ORB para ser robusto a iluminación/ángulo."""
-    if img1 is None or img2 is None:
-        return None, False
-
-    size = (400, 400)
+def _doc_similarity_score(img1, img2) -> float:
+    """
+    Devuelve un score 0-100 que representa qué tan similares son dos imágenes
+    de documento. Combina aHash (40%) + ORB keypoints (60%).
+    """
+    size   = (400, 400)
     img1_r = cv2.resize(img1, size)
     img2_r = cv2.resize(img2, size)
 
-    # 1) Perceptual hash (robusto a iluminación)
-    h1 = _average_hash(img1_r)
-    h2 = _average_hash(img2_r)
-    dist = _hamming_distance(h1, h2)
-    hash_bits = len(h1)
-    hash_sim = max(0, 100 - (dist / hash_bits * 100))
+    h1, h2   = _average_hash(img1_r), _average_hash(img2_r)
+    hash_sim = max(0.0, 100.0 - (_hamming_distance(h1, h2) / len(h1) * 100))
+    orb_sim  = _orb_similarity(img1_r, img2_r)
 
-    # 2) ORB feature matching (robusto a ángulo/perspectiva)
-    orb_sim = _orb_similarity(img1_r, img2_r)
-
-    # Combinar: peso 40% hash + 60% features
     combined = hash_sim * 0.4 + orb_sim * 0.6
-
-    logger.info(
-        "[DUPLICATE] hash_sim=%.1f%% orb_sim=%.1f%% combined=%.1f%%",
-        hash_sim, orb_sim, combined,
-    )
-    return round(combined, 2), combined >= 70.0
+    logger.info("[DOC-SIM] hash=%.1f%% orb=%.1f%% combined=%.1f%%", hash_sim, orb_sim, combined)
+    return round(combined, 2)
 
 
+def classify_back_document(front_img, back_img) -> tuple[float, str]:
+    """
+    Opción B — Clasifica el estado del dorso del documento.
+
+    Returns:
+        (similarity_score, status)
+        status puede ser:
+          "same_as_front" → dorso = frente (misma foto subida dos veces)
+          "duplicate"     → muy similares pero no idénticos (≥70%)
+          "ok"            → dorso diferente al frente — correcto
+    """
+    score = _doc_similarity_score(front_img, back_img)
+
+    if score >= BACK_IDENTICAL_THRESHOLD:
+        status = "same_as_front"
+    elif score >= 70.0:
+        status = "duplicate"
+    else:
+        status = "ok"
+
+    logger.info("[BACK] score=%.1f%% → status=%s", score, status)
+    return score, status
+
+
+# ---------------------------------------------------------------------------
+# Opción C — Detección de fraude: selfie ≈ documento
+# ---------------------------------------------------------------------------
+def detect_selfie_document_fraud(selfie_img, doc_img) -> tuple[float, bool]:
+    """
+    Compara selfie vs frente del documento a nivel de imagen (no de rostro).
+    Si la similitud de imagen es muy alta → el usuario subió la misma foto
+    como selfie y como documento.
+
+    Returns:
+        (image_similarity_score, is_fraud)
+    """
+    score    = _doc_similarity_score(selfie_img, doc_img)
+    is_fraud = score >= SELFIE_DOC_FRAUD_THRESHOLD
+    logger.info("[FRAUD] selfie-vs-doc score=%.1f%% → is_fraud=%s", score, is_fraud)
+    return score, is_fraud
+
+
+# ---------------------------------------------------------------------------
+# OCR y matching de campos
+# ---------------------------------------------------------------------------
 def field_text_matches(expected_value: str, extracted_text: str) -> bool:
-    """Verifica que TODAS las palabras del campo esperado aparezcan como
-    tokens independientes en el texto OCR. Si falla, intenta matching
-    compacto (sin espacios) para números con formato variable."""
     words = normalize_text(expected_value).split()
     if not words:
         return False
-
-    # 1) Check estándar: cada palabra como token independiente
     for word in words:
         if not re.search(r"\b" + re.escape(word) + r"\b", extracted_text):
-            # 2) Fallback compacto: unir todo sin espacios (para "6302723" vs "630 2723")
             compact_expected = "".join(words)
-            compact_text = "".join(extracted_text.split())
+            compact_text     = "".join(extracted_text.split())
             return compact_expected in compact_text
     return True
 
 
 def _fuzzy_date_matches(expected: str, extracted_text: str) -> bool:
-    """Matching tolerante a errores OCR en fechas.
-    Busca patrón DD MM YYYY en el texto con tolerancia ±2 en día, ±1 en mes."""
     m = re.search(r"(\d{1,2})\s+(\d{1,2})\s+(\d{4})", extracted_text)
     if not m:
         return False
@@ -307,16 +375,14 @@ def _fuzzy_date_matches(expected: str, extracted_text: str) -> bool:
 
 
 def field_text_matches_smart(field: str, expected_value: str, extracted_text: str) -> bool:
-    """Matching inteligente. tipoDoc se ignora porque no es relevante."""
     if field == "tipoDoc":
-        return True  # Siempre matchea - no es relevante
+        return True
     return field_text_matches(expected_value, extracted_text)
 
 
-def extract_document_text(ocr_reader, img) -> str:
-    """Ejecuta OCR filtrando resultados de baja confianza."""
-    results = ocr_reader.readtext(img, detail=1)
-    lines = [normalize_text(text) for _, text, conf in results if conf >= OCR_MIN_CONFIDENCE]
+def extract_document_text(reader, img) -> str:
+    results   = reader.readtext(img, detail=1)
+    lines     = [normalize_text(text) for _, text, conf in results if conf >= OCR_MIN_CONFIDENCE]
     full_text = " ".join(lines)
     logger.info("[OCR] Texto extraído: %s", full_text)
     return full_text
@@ -332,27 +398,59 @@ def health():
         "gpu": use_gpu,
         "device": str(device),
         "model": "InceptionResnetV1 (VGGFace2)",
-        "threshold": FACE_SIMILARITY_THRESHOLD,
+        "thresholds": {
+            "face_both":           FACE_THRESHOLD_BOTH,
+            "face_one":            FACE_THRESHOLD_ONE,
+            "back_identical":      BACK_IDENTICAL_THRESHOLD,
+            "selfie_doc_fraud":    SELFIE_DOC_FRAUD_THRESHOLD,
+        },
     }
 
 
 @app.post("/verify")
 def verify_identity(data: VerificationRequest):
-    # Endpoint síncrono: FastAPI lo ejecuta en un threadpool, sin bloquear
-    # el event loop durante OCR/visión.
+    """
+    Verifica identidad combinando:
+      - Comparación facial selfie vs documento (con threshold dinámico)
+      - OCR + matching de campos del formulario
+      - Detección fraude: selfie = documento (Opción C)
+      - Clasificación del dorso: ok / same_as_front / duplicate (Opción B)
+
+    Campos nuevos en la respuesta:
+      face_quality          : "high" | "degraded" | "failed"
+      face_threshold_used   : float — threshold aplicado según calidad
+      is_selfie_fraud       : bool  — selfie y doc son la misma imagen
+      selfie_doc_similarity : float — score imagen selfie vs doc
+      back_document_status  : "ok" | "same_as_front" | "duplicate"
+      back_similarity       : float — score similitud frente vs dorso
+    """
     try:
         selfie_img = b64_to_cv2(data.selfie_b64)
-        id_img = b64_to_cv2(data.id_card_b64)
+        id_img     = b64_to_cv2(data.id_card_b64)
 
         if selfie_img is None or id_img is None:
             raise HTTPException(
                 status_code=422,
-                detail="No se pudo decodificar una o ambas imágenes a formato OpenCV.",
+                detail="No se pudo decodificar una o ambas imágenes.",
             )
 
-        similarity_pct, face_state = calculate_similarity(selfie_img, id_img)
+        # ── Similitud facial con threshold dinámico (Opción A) ──────────
+        similarity_pct, face_state, is_same_person, face_quality = calculate_similarity(
+            selfie_img, id_img
+        )
 
-        logger.info("[VERIFY] form_data recibido: %s", data.form_data)
+        if face_state == "none":
+            threshold_used = FACE_THRESHOLD_BOTH  # referencia, pero se rechazó por calidad
+        elif face_state == "both":
+            threshold_used = FACE_THRESHOLD_BOTH
+        else:
+            threshold_used = FACE_THRESHOLD_ONE
+
+        # ── Fraude: selfie idéntica al documento (Opción C) ─────────────
+        selfie_doc_sim, is_selfie_fraud = detect_selfie_document_fraud(selfie_img, id_img)
+
+        # ── OCR + matching de campos ─────────────────────────────────────
+        logger.info("[VERIFY] form_data: %s", data.form_data)
         extracted_text = extract_document_text(ocr_reader, id_img)
 
         field_matches = {}
@@ -360,27 +458,45 @@ def verify_identity(data: VerificationRequest):
             if not expected_value:
                 field_matches[field] = False
                 continue
-            match = field_text_matches_smart(field, expected_value, extracted_text)
-            logger.info("[MATCH] '%s' -> '%s': %s | regex: %s", field, expected_value, match, r"\b" + re.escape(normalize_text(expected_value)) + r"\b")
-            field_matches[field] = match
+            field_matches[field] = field_text_matches_smart(field, expected_value, extracted_text)
 
-        # Detección de documentos duplicados (frente vs dorso)
-        doc_duplicate_sim = None
-        is_doc_duplicate = False
-        if data.id_card_back_b64:
+        # ── Clasificación del dorso (Opción B) ──────────────────────────
+        back_similarity    = None
+        back_document_status = "not_provided"   # no debería ocurrir según el contexto
+
+        if data.id_card_back_b64.strip():
             id_back_img = b64_to_cv2(data.id_card_back_b64)
             if id_back_img is not None:
-                doc_duplicate_sim, is_doc_duplicate = detect_duplicate_documents(id_img, id_back_img)
-                logger.info("[DUPLICATE] Similitud documentos: %s%%, duplicado: %s", doc_duplicate_sim, is_doc_duplicate)
+                back_similarity, back_document_status = classify_back_document(id_img, id_back_img)
+            else:
+                back_document_status = "decode_error"
+        else:
+            back_document_status = "not_provided"
 
         return {
             "status": "success",
-            "face_detected": face_state,
-            "facial_similarity": similarity_pct,
-            "is_same_person": similarity_pct >= FACE_SIMILARITY_THRESHOLD,
+
+            # ── Resultados faciales ──────────────────────────────────────
+            "face_detected":        face_state,
+            "face_quality":         face_quality,
+            "face_threshold_used":  threshold_used,
+            "facial_similarity":    similarity_pct,
+            "is_same_person":       is_same_person,
+
+            # ── Fraude selfie = documento (Opción C) ─────────────────────
+            "is_selfie_fraud":      is_selfie_fraud,
+            "selfie_doc_similarity": selfie_doc_sim,
+
+            # ── Campos del formulario ────────────────────────────────────
             "field_matches": field_matches,
-            "document_duplicate_similarity": doc_duplicate_sim,
-            "is_document_duplicate": is_doc_duplicate,
+
+            # ── Estado del dorso (Opción B) ──────────────────────────────
+            "back_document_status": back_document_status,
+            "back_similarity":      back_similarity,
+
+            # ── Compatibilidad hacia atrás ───────────────────────────────
+            "document_duplicate_similarity": back_similarity,
+            "is_document_duplicate":         back_document_status in ("same_as_front", "duplicate"),
         }
 
     except HTTPException:

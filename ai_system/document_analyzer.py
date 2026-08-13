@@ -57,9 +57,11 @@ class DocumentAnalyzer:
         """Load prompt templates from files."""
         self.prompts = {}
         prompt_files = {
-            "analyze_document": "analyze_document.txt",
-            "validate_coherence": "validate_coherence.txt",
-            "detect_tampering": "detect_tampering.txt",
+            "analyze_document":    "analyze_document.txt",
+            "validate_coherence":  "validate_coherence.txt",
+            "detect_tampering":    "detect_tampering.txt",
+            "verify_face_match":   "verify_face_match.txt",
+            "verify_back_document":"verify_back_document.txt",
         }
         for key, filename in prompt_files.items():
             prompt_path = PROMPTS_DIR / filename
@@ -223,8 +225,14 @@ class DocumentAnalyzer:
         doc_back_b64: Optional[str],
         form_data: dict,
     ) -> AIAnalysis:
-        """Main analysis: coherence check + tampering detection → overall confidence."""
-
+        """
+        Pipeline completo de análisis:
+          1. Coherencia de datos del formulario (texto + Ollama)
+          2. Detección de tampering en el frente (visión llava)
+          3. Análisis facial: selfie vs foto del documento (visión llava) [Opción D]
+          4. Verificación del dorso del documento (visión llava) [Opción D]
+          5. Cálculo de confianza global ponderando los 4 factores
+        """
         logger.info("[AI] Starting coherence analysis...")
         coherence = self._analyze_coherence(form_data)
         logger.info("[AI] Coherence result: %s", coherence)
@@ -233,15 +241,35 @@ class DocumentAnalyzer:
         tampering = self._detect_tampering(doc_front_b64)
         logger.info("[AI] Tampering result: %s", tampering)
 
-        overall = self._calculate_overall_confidence(coherence, tampering)
+        # Opción D — Análisis facial por IA
+        logger.info("[AI] Starting face match analysis...")
+        face_match = self._analyze_face_match(selfie_b64, doc_front_b64)
+        logger.info("[AI] Face match result: %s", face_match)
 
-        coherence_score  = coherence.get("score", 50) if isinstance(coherence, dict) else 50
-        coherence_issues = coherence.get("issues", [])  if isinstance(coherence, dict) else []
-        tampering_score  = tampering.get("tampering_score", 50) if isinstance(tampering, dict) else 50
-        tampering_areas  = tampering.get("suspicious_areas", []) if isinstance(tampering, dict) else []
-        extracted_data   = tampering.get("extracted_fields", {}) if isinstance(tampering, dict) else {}
+        # Opción D — Verificación del dorso
+        back_analysis: Optional[dict] = None
+        if doc_back_b64:
+            logger.info("[AI] Starting back document verification...")
+            back_analysis = self._verify_back_document(doc_back_b64)
+            logger.info("[AI] Back document result: %s", back_analysis)
 
-        coherence_reasoning = coherence.get("reasoning", "") if isinstance(coherence, dict) else ""
+        overall = self._calculate_overall_confidence(coherence, tampering, face_match, back_analysis)
+
+        # Extraer valores con defaults seguros
+        coherence_score  = coherence.get("score", 50)            if isinstance(coherence, dict)  else 50
+        coherence_issues = coherence.get("issues", [])           if isinstance(coherence, dict)  else []
+        tampering_score  = tampering.get("tampering_score", 50)  if isinstance(tampering, dict)  else 50
+        tampering_areas  = tampering.get("suspicious_areas", []) if isinstance(tampering, dict)  else []
+        extracted_data   = tampering.get("extracted_fields", {}) if isinstance(tampering, dict)  else {}
+
+        face_score       = face_match.get("face_match_score", -1) if isinstance(face_match, dict) else -1
+        face_issues      = face_match.get("issues", [])           if isinstance(face_match, dict) else []
+        face_reasoning   = face_match.get("reasoning", "")        if isinstance(face_match, dict) else ""
+
+        back_score       = back_analysis.get("back_score", -1)   if isinstance(back_analysis, dict) else -1
+        back_issues      = back_analysis.get("issues", [])        if isinstance(back_analysis, dict) else []
+
+        coherence_reasoning = coherence.get("reasoning", "")     if isinstance(coherence, dict)  else ""
         tampering_reasoning = tampering.get("overall_assessment", "") if isinstance(tampering, dict) else ""
 
         return AIAnalysis(
@@ -252,6 +280,11 @@ class DocumentAnalyzer:
             extracted_data=extracted_data,
             overall_confidence=overall,
             reasoning=f"{coherence_reasoning} {tampering_reasoning}".strip(),
+            face_match_score=face_score,
+            face_match_issues=face_issues,
+            face_match_reasoning=face_reasoning,
+            back_analysis_score=back_score,
+            back_analysis_issues=back_issues,
         )
 
     def _analyze_coherence(self, form_data: dict) -> dict:
@@ -324,25 +357,168 @@ class DocumentAnalyzer:
             logger.error("[AI] Tampering detection error: %s", str(e))
             return {"tampering_score": 50, "suspicious_areas": [], "overall_assessment": f"Error: {str(e)}"}
 
-    def _calculate_overall_confidence(self, coherence: dict, tampering: dict) -> float:
-        """Weighted average: coherence 40% + tampering 60%, with per-issue penalty."""
+    def _calculate_overall_confidence(
+        self,
+        coherence: dict,
+        tampering: dict,
+        face_match: Optional[dict] = None,
+        back_analysis: Optional[dict] = None,
+    ) -> float:
+        """
+        Confianza global ponderada:
+          - Coherencia de datos:  25%
+          - Integridad (tampering): 35%
+          - Coincidencia facial IA: 25%  (si disponible, sino se distribuye entre los otros)
+          - Verificación dorso:    15%  (si disponible)
+
+        Si el análisis facial no está disponible (face_match_score == -1),
+        los pesos se redistribuyen a coherencia 35% + tampering 65%.
+        """
         try:
             coherence_score = coherence.get("score", 50) if isinstance(coherence, dict) else 50
             tampering_score = tampering.get("tampering_score", 50) if isinstance(tampering, dict) else 50
 
-            overall = (coherence_score * 0.4) + (tampering_score * 0.6)
+            face_score = face_match.get("face_match_score", -1) if isinstance(face_match, dict) else -1
+            back_score = back_analysis.get("back_score", -1)    if isinstance(back_analysis, dict) else -1
 
+            has_face = face_score >= 0
+            has_back = back_score >= 0
+
+            if has_face and has_back:
+                # Todos disponibles: 25 + 35 + 25 + 15 = 100
+                overall = (coherence_score * 0.25 + tampering_score * 0.35 +
+                           face_score * 0.25 + back_score * 0.15)
+            elif has_face and not has_back:
+                # Sin dorso: 25 + 40 + 35 = 100
+                overall = (coherence_score * 0.25 + tampering_score * 0.40 +
+                           face_score * 0.35)
+            elif has_back and not has_face:
+                # Sin face match: 30 + 55 + 15 = 100
+                overall = (coherence_score * 0.30 + tampering_score * 0.55 +
+                           back_score * 0.15)
+            else:
+                # Solo coherencia + tampering
+                overall = coherence_score * 0.40 + tampering_score * 0.60
+
+            # Penalización por issues de coherencia
             issues_count = len(coherence.get("issues", []) if isinstance(coherence, dict) else [])
             if issues_count > 0:
-                overall *= (1 - (issues_count * 0.1))
+                overall *= (1 - issues_count * 0.08)
+
+            # Penalización severa si face_match indica fraude explícito
+            if has_face and face_score < 20:
+                overall = min(overall, 30.0)  # capear en 30 si la IA ve personas distintas
+
+            # Penalización si el dorso parece ser el frente (is_back=False)
+            if has_back and isinstance(back_analysis, dict):
+                if not back_analysis.get("is_back", True):
+                    overall *= 0.85  # -15% por dorso incorrecto
 
             result = round(max(0.0, min(100.0, overall)), 2)
-            logger.info("[AI] Confidence: coherence=%.1f, tampering=%.1f, overall=%.1f",
-                        coherence_score, tampering_score, result)
+            logger.info(
+                "[AI] Confidence: coh=%.1f tam=%.1f face=%.1f back=%.1f → overall=%.1f",
+                coherence_score, tampering_score,
+                face_score if has_face else -1,
+                back_score if has_back else -1,
+                result,
+            )
             return result
         except Exception as e:
             logger.error("[AI] Error calculating confidence: %s", str(e))
             return 50.0
+
+    # ------------------------------------------------------------------
+    # Opción D — Análisis facial por IA (selfie vs foto del documento)
+    # ------------------------------------------------------------------
+
+    def _analyze_face_match(self, selfie_b64: str, doc_front_b64: str) -> dict:
+        """
+        Usa llava:7b para comparar la selfie con la foto del documento.
+        Ollama no puede procesar dos imágenes en el mismo prompt nativo,
+        por lo que se usa un truco: enviar las dos imágenes en el array
+        'images' y pedirle al modelo que compare la primera con la segunda.
+        """
+        try:
+            prompt = self._build_system_prompt("verify_face_match")
+            if not prompt.strip():
+                return {"face_match_score": -1, "issues": [], "reasoning": "Prompt no disponible"}
+
+            logger.info("[AI] Calling Ollama for face match (selfie vs doc)...")
+
+            # Limpiar prefijos data URI de ambas imágenes
+            def strip_prefix(b64: str) -> str:
+                return b64.split(",", 1)[1] if "," in b64 else b64
+
+            selfie_clean   = strip_prefix(selfie_b64)
+            doc_front_clean = strip_prefix(doc_front_b64)
+
+            # Pasar ambas imágenes en el array — llava las procesa en orden
+            response = self.ollama.analyze_image_pair(selfie_clean, doc_front_clean, prompt)
+            logger.info("[AI] Raw face match response: %s", str(response)[:200])
+
+            result = self._extract_json_from_response(response)
+
+            # Normalizar campo face_match_score desde posibles variantes
+            if "face_match_score" not in result:
+                if "score" in result:
+                    result["face_match_score"] = result["score"]
+                elif "similarity" in result:
+                    result["face_match_score"] = result["similarity"]
+                else:
+                    result["face_match_score"] = 50
+
+            # Asegurar que issues y reasoning existan
+            if "issues" not in result:
+                result["issues"] = []
+            if "reasoning" not in result:
+                result["reasoning"] = result.get("overall_assessment", "")
+
+            return result
+
+        except Exception as e:
+            logger.error("[AI] Face match analysis error: %s", str(e))
+            return {"face_match_score": -1, "issues": [f"Error: {str(e)}"], "reasoning": ""}
+
+    # ------------------------------------------------------------------
+    # Opción D — Verificación del dorso del documento
+    # ------------------------------------------------------------------
+
+    def _verify_back_document(self, doc_back_b64: str) -> dict:
+        """
+        Usa llava:7b para verificar que la imagen provista es el dorso real
+        del documento y no la cara frontal subida por error.
+        """
+        try:
+            prompt = self._build_system_prompt("verify_back_document")
+            if not prompt.strip():
+                return {"back_score": -1, "is_back": True, "issues": []}
+
+            logger.info("[AI] Calling Ollama for back document verification...")
+            response = self.ollama.analyze_image(doc_back_b64, prompt)
+            logger.info("[AI] Raw back document response: %s", str(response)[:200])
+
+            result = self._extract_json_from_response(response)
+
+            # Normalizar campo back_score
+            if "back_score" not in result:
+                if "score" in result:
+                    result["back_score"] = result["score"]
+                elif "tampering_score" in result:
+                    result["back_score"] = result["tampering_score"]
+                else:
+                    result["back_score"] = 50
+
+            if "is_back" not in result:
+                result["is_back"] = result.get("back_score", 50) >= 50
+
+            if "issues" not in result:
+                result["issues"] = []
+
+            return result
+
+        except Exception as e:
+            logger.error("[AI] Back document verification error: %s", str(e))
+            return {"back_score": -1, "is_back": True, "issues": [f"Error: {str(e)}"]}
 
     # ------------------------------------------------------------------
     # Decision helpers

@@ -129,6 +129,55 @@ class OllamaClient:
             logger.error("[OLLAMA] Exception: %s", str(e))
             return {"error": str(e)}
     
+    def analyze_image_pair(
+        self,
+        image_a_b64: str,
+        image_b_b64: str,
+        prompt: str,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Opción D — Compara dos imágenes enviándolas juntas en el array 'images'.
+        llava procesa las imágenes en orden: la primera es la imagen A (selfie),
+        la segunda es la imagen B (foto del documento).
+        Ambos b64 deben estar sin prefijo data URI.
+        """
+        import logging
+        logger = logging.getLogger("ai-system")
+        model = model or OLLAMA_VISION_MODEL
+
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "images": [image_a_b64, image_b_b64],
+            "stream": False,
+            "options": {
+                "temperature": 0.2,   # más determinista para comparación biométrica
+                "top_p": 0.9,
+            },
+        }
+
+        try:
+            logger.info("[OLLAMA] Sending image-pair request to %s (model=%s)", self.base_url, model)
+            response = self.client.post(f"{self.base_url}/api/generate", json=payload)
+            logger.info("[OLLAMA] Response status: %d", response.status_code)
+
+            if response.status_code == 200:
+                result      = response.json()
+                raw_response = result.get("response", "")
+                logger.info("[OLLAMA] Raw face-pair response (200 chars): %s", str(raw_response)[:200])
+                return self._parse_json_response(raw_response)
+            else:
+                logger.error("[OLLAMA] HTTP error: %d - %s", response.status_code, response.text[:200])
+                return {"error": f"HTTP {response.status_code}", "face_match_score": -1}
+
+        except httpx.ConnectError:
+            return {"error": "connection_failed", "face_match_score": -1,
+                    "message": "No se pudo conectar a Ollama."}
+        except Exception as e:
+            logger.error("[OLLAMA] Exception in analyze_image_pair: %s", str(e))
+            return {"error": str(e), "face_match_score": -1}
+
     def analyze_text(self, text: str, prompt: str, model: Optional[str] = None) -> Dict[str, Any]:
         """Analyze text using a language model."""
         model = model or OLLAMA_TEXT_MODEL

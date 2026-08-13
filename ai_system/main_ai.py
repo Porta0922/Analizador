@@ -167,6 +167,11 @@ def analyze_document(request: AnalysisRequest):
             "processing_time_ms": result.processing_time_ms,
             "should_reject": analyzer.should_reject(ai_analysis),
             "summary": analyzer.get_analysis_summary(ai_analysis),
+            # Opción D — flags rápidos para la extensión
+            "face_match_available": ai_analysis.face_match_score >= 0,
+            "face_match_score":     ai_analysis.face_match_score,
+            "back_verified":        ai_analysis.back_analysis_score >= 0,
+            "back_is_back":         ai_analysis.back_analysis_issues == [] and ai_analysis.back_analysis_score >= 50,
         }
 
     except Exception as e:
