@@ -2,6 +2,8 @@ import json
 import hashlib
 import base64
 import logging
+import re
+import unicodedata
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -39,6 +41,18 @@ PROMPT_PATTERN_TYPES = {
     "tampering": ["tampering_sign"],
     "all":       ["name_format", "document_type", "date_format", "number_format",
                   "gender_format", "common_error", "tampering_sign", "field_regex"],
+}
+
+# Etiquetas legibles para que llava ubique cada campo en la imagen del documento
+FIELD_LABELS = {
+    "primerNombre":    "primer nombre",
+    "segundoNombre":   "segundo nombre",
+    "primerApellido":  "primer apellido",
+    "segundoApellido": "segundo apellido",
+    "numeroDoc":       "número de cédula de identidad (CI)",
+    "tipoDoc":         "tipo de documento",
+    "sexo":            "sexo",
+    "fechaNacimiento": "fecha de nacimiento",
 }
 
 
@@ -413,6 +427,111 @@ class DocumentAnalyzer:
         except Exception as e:
             logger.error("[AI] Tampering detection error: %s", str(e))
             return {"tampering_score": 50, "suspicious_areas": [], "overall_assessment": f"Error: {str(e)}"}
+
+    # ------------------------------------------------------------------
+    # Etapa 2 — Extracción visual de campos (llava) cuando EasyOCR falla
+    # ------------------------------------------------------------------
+
+    def _normalize_for_compare(self, value: str) -> str:
+        """
+        Normaliza un valor para comparación tolerante:
+        mayúsculas, sin tildes, sin símbolos ni espacios múltiples.
+        """
+        text = unicodedata.normalize("NFD", value)
+        text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+        text = re.sub(r"[^A-Z0-9 ]", " ", text.upper())
+        return " ".join(text.split())
+
+    def _fuzzy_field_match(self, field: str, expected_value: str, extracted_value: str) -> bool:
+        """
+        Comparación tolerante a errores OCR entre el valor esperado y el que
+        extrajo llava visualmente. Estrategia por tipo de campo:
+          - numero* / doc   → compara solo dígitos (acepta puntos/espacios)
+          - fecha* / date*  → compara dígitos en orden (DD MM YYYY)
+          - resto           → todos los tokens del esperado presentes en lo extraído
+        """
+        if not expected_value or not extracted_value:
+            return False
+
+        field_lower = field.lower().replace(" ", "")
+
+        # Número de documento: comparar solo dígitos
+        if "numero" in field_lower or field_lower in ("doc", "documento"):
+            exp_digits = re.sub(r"\D", "", self._normalize_for_compare(expected_value))
+            ext_digits = re.sub(r"\D", "", self._normalize_for_compare(extracted_value))
+            if not exp_digits or not ext_digits:
+                return False
+            return exp_digits == ext_digits or exp_digits in ext_digits or ext_digits in exp_digits
+
+        # Fechas: dígitos en el mismo orden
+        if "fecha" in field_lower or "nacimiento" in field_lower:
+            exp_digits = re.sub(r"\D", "", self._normalize_for_compare(expected_value))
+            ext_digits = re.sub(r"\D", "", self._normalize_for_compare(extracted_value))
+            if not exp_digits or not ext_digits:
+                return False
+            return exp_digits == ext_digits
+
+        # Texto libre: todos los tokens del esperado deben aparecer en lo extraído
+        exp = self._normalize_for_compare(expected_value)
+        ext = self._normalize_for_compare(extracted_value)
+        exp_tokens = exp.split()
+        return bool(exp_tokens) and all(tok in ext for tok in exp_tokens)
+
+    def _extract_fields_visual(self, image_b64: str, fields: Dict[str, str]) -> dict:
+        """
+        Etapa 2 — Envía la imagen del documento a llava:7b para que lea
+        visualmente los campos que EasyOCR no pudo confirmar.
+
+        Args:
+            image_b64: imagen del frente del documento (con o sin prefijo data URI)
+            fields:    dict {campo: valor_esperado} de los campos fallidos por OCR
+
+        Returns:
+            {"extracted_fields": {campo: valor_leido_o_null}}
+        """
+        try:
+            template = self.prompts.get("extract_fields_visual", "")
+            if not template.strip():
+                logger.warning("[AI] Etapa 2: prompt extract_fields_visual no disponible")
+                return {"extracted_fields": {}}
+
+            fields_list = "\n".join(
+                f"- {FIELD_LABELS.get(field, field)} (en el formulario figura: '{value}')"
+                for field, value in fields.items()
+            )
+            # replace en vez de format: el template contiene JSON de ejemplo con
+            # llaves que Python interpretaría como placeholders (KeyError)
+            prompt = template.replace("{fields_list}", fields_list)
+
+            logger.info("[AI] Etapa 2: enviando %d campos a llava: %s",
+                        len(fields), list(fields.keys()))
+            response = self.ollama.analyze_image(image_b64, prompt)
+            result = self._extract_json_from_response(response)
+
+            # Forma canónica: {"extracted_fields": {...}}
+            if isinstance(result.get("extracted_fields"), dict):
+                return result
+
+            # Otras formas comunes: {"fields": ...}, {"data": ...}, o campos directos
+            for key in ("fields", "data", "extracted", "values"):
+                if isinstance(result.get(key), dict):
+                    return {"extracted_fields": result[key]}
+
+            direct = {
+                f: result[f]
+                for f in fields
+                if f in result and isinstance(result.get(f), str)
+            }
+            if direct:
+                return {"extracted_fields": direct}
+
+            logger.warning("[AI] Etapa 2: llava no devolvió campos parseables: %s",
+                           str(result)[:200])
+            return {"extracted_fields": {}}
+
+        except Exception as e:
+            logger.error("[AI] Etapa 2 visual extraction error: %s", str(e))
+            return {"extracted_fields": {}}
 
     def _calculate_overall_confidence(
         self,

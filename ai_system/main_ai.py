@@ -46,6 +46,9 @@ class AnalysisRequest(BaseModel):
     doc_front_b64: str = Field(min_length=1)
     doc_back_b64: Optional[str] = Field(default=None)
     form_data: dict = Field(default_factory=dict)
+    # Etapa 2 — result de field_matches del backend principal (/verify):
+    # dict {campo: True|False|None}. Los False se re-verifican con llava.
+    ocr_field_matches: Optional[dict] = Field(default=None)
 
 
 class FeedbackRequest(BaseModel):
@@ -146,6 +149,7 @@ def analyze_document(request: AnalysisRequest):
             request.doc_front_b64,
             request.doc_back_b64,
             request.form_data,
+            ocr_field_matches=request.ocr_field_matches,
         )
         logger.info("[AI] Analysis completed")
 
@@ -172,6 +176,8 @@ def analyze_document(request: AnalysisRequest):
             "face_match_score":     ai_analysis.face_match_score,
             "back_verified":        ai_analysis.back_analysis_score >= 0,
             "back_is_back":         ai_analysis.back_analysis_issues == [] and ai_analysis.back_analysis_score >= 50,
+            # Etapa 2 — campos que llava re-verificó visualmente
+            "visual_field_matches": ai_analysis.visual_field_matches,
         }
 
     except Exception as e:

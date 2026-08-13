@@ -345,7 +345,7 @@ async function verify() {
 
     // Call AI backend for additional analysis (once only)
     if (!document.getElementById("ai-analysis-section")) {
-      analyzeWithAI(selfie, id, idBack, formData).then((aiResult) => {
+      analyzeWithAI(selfie, id, idBack, formData, data.field_matches || null).then((aiResult) => {
         if (aiResult && aiResult.result && !document.getElementById("ai-analysis-section")) {
           renderAIResults(aiResult);
         }
@@ -623,6 +623,7 @@ function renderResults(res) {
 
   // ── Campos del formulario ─────────────────────────────────────────────────
   const fieldSummary = document.createElement("div");
+  fieldSummary.className = "field-summary";
   fieldSummary.style.cssText =
     "font-size:11px;color:#aaa;border-top:1px solid rgba(255,255,255,0.15);" +
     "padding-top:6px;margin-top:4px;";
@@ -801,6 +802,50 @@ function renderAIResults(aiResult) {
     aiDiv.appendChild(areas);
   }
 
+  // ── Etapa 2: campos re-verificados visualmente por llava ─────────────────
+  const visMatches = result.visual_field_matches || {};
+  const visEntries = Object.entries(visMatches).filter(
+    ([, v]) => typeof v === "boolean"
+  );
+  if (visEntries.length > 0) {
+    const visDiv = document.createElement("div");
+    visDiv.style.cssText = "font-size:9px;color:#aaa;margin-top:4px;line-height:1.4;";
+
+    const visTitle = document.createElement("div");
+    visTitle.style.cssText = "font-weight:bold;color:#e0e0e0;margin-bottom:2px;";
+    visTitle.textContent = "Re-verificados visualmente (llava):";
+    visDiv.appendChild(visTitle);
+
+    const visList = document.createElement("div");
+    visList.textContent = visEntries
+      .map(([field, ok]) => `${ok ? "✓" : "✗"} ${field}`)
+      .join("  ·  ");
+    visDiv.appendChild(visList);
+
+    aiDiv.appendChild(visDiv);
+
+    // Re-pintar los inputs que OCR marcó como fallidos pero llava confirmó,
+    // y actualizar el resumen "Campos: X/Y"
+    const summaryEl = badge.querySelector(".field-summary");
+    let confirmedCount = 0;
+    for (const [key, ok] of visEntries) {
+      const input = findInputByFieldKey(key);
+      if (!input) continue;
+      input.classList.remove("valid-field", "invalid-field", "unknown-field");
+      input.classList.add(ok ? "valid-field" : "invalid-field");
+      if (ok) confirmedCount++;
+    }
+    if (summaryEl && confirmedCount > 0) {
+      const m = summaryEl.textContent.match(/(\d+)\/(\d+)/);
+      if (m) {
+        const [all, ok] = [parseInt(m[2], 10), parseInt(m[1], 10)];
+        summaryEl.textContent =
+          `Campos: ${ok + confirmedCount}/${all} coinciden en documento ` +
+          `(${confirmedCount} confirmados por IA)`;
+      }
+    }
+  }
+
   // ── Botones de feedback ───────────────────────────────────────────────────
   const btnContainer = document.createElement("div");
   btnContainer.style.cssText = "display:flex;gap:4px;margin-top:7px;";
@@ -977,7 +1022,7 @@ function currentSelfieImg() {
 // AI Analysis Functions
 // ---------------------------------------------------------------------------
 
-async function analyzeWithAI(selfieB64, idFrontB64, idBackB64, formData) {
+async function analyzeWithAI(selfieB64, idFrontB64, idBackB64, formData, ocrFieldMatches) {
   try {
     const resp = await fetch(`${CONFIG.AI_BACKEND_URL}/ai/analyze`, {
       method: "POST",
@@ -987,6 +1032,7 @@ async function analyzeWithAI(selfieB64, idFrontB64, idBackB64, formData) {
         doc_front_b64: idFrontB64,
         doc_back_b64: idBackB64 || null,
         form_data: formData,
+        ocr_field_matches: ocrFieldMatches || null,
       }),
     });
 

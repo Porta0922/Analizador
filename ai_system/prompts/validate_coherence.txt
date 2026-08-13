@@ -30,7 +30,7 @@ Fecha Nacimiento: {fecha}
 
 ## Formato de respuesta:
 Responde EXCLUSIVAMENTE con JSON válido, sin texto adicional:
-{"score": 80, "issues": [], "is_valid": true, "reasoning": ""}
+{{"score": 80, "issues": [], "is_valid": true, "reasoning": ""}}
 
 - score: 0–100 donde 100 = sin problemas
 - issues: lista de strings con los problemas encontrados (vacía si no hay problemas)

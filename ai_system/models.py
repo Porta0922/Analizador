@@ -23,6 +23,9 @@ class AIAnalysis:
     back_analysis_score: float = -1.0       # 0-100, -1 = no ejecutado
     back_analysis_issues: List[str] = field(default_factory=list)
 
+    # Etapa 2 — Campos que OCR marcó como fallidos y llava re-evaluó visualmente
+    visual_field_matches: Dict[str, Optional[bool]] = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         return {
             "coherence_score":      self.coherence_score,
@@ -38,6 +41,8 @@ class AIAnalysis:
             "face_match_reasoning": self.face_match_reasoning,
             "back_analysis_score":  self.back_analysis_score,
             "back_analysis_issues": self.back_analysis_issues,
+            # Etapa 2 — re-verificación visual de campos
+            "visual_field_matches": self.visual_field_matches,
         }
 
 
