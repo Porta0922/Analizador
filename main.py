@@ -330,19 +330,85 @@ def classify_back_document(front_img, back_img) -> tuple[float, str]:
 # ---------------------------------------------------------------------------
 # Opción C — Detección de fraude: selfie ≈ documento
 # ---------------------------------------------------------------------------
-def detect_selfie_document_fraud(selfie_img, doc_img) -> tuple[float, bool]:
+
+# Niveles de fraude — usados en fraud_reason
+# "identical_image"   : imagen idéntica a nivel de píxeles (>92%) Y embedding facial idéntico (>95%)
+# "photo_of_screen"   : imagen muy similar (>85%) pero embedding facial NO idéntico → foto de pantalla
+# "none"              : no se detectó fraude
+FRAUD_FACE_IDENTICAL_THRESHOLD  = float(os.getenv("FRAUD_FACE_IDENTICAL_THRESHOLD",  "95.0"))
+FRAUD_IMAGE_HIGH_THRESHOLD      = float(os.getenv("FRAUD_IMAGE_HIGH_THRESHOLD",      "85.0"))
+
+
+def detect_selfie_document_fraud(
+    selfie_img,
+    doc_img,
+    face_similarity_pct: float,
+    face_state: str,
+) -> tuple[float, bool, str]:
     """
-    Compara selfie vs frente del documento a nivel de imagen (no de rostro).
-    Si la similitud de imagen es muy alta → el usuario subió la misma foto
-    como selfie y como documento.
+    Opción C mejorada — Detecta fraude combinando dos señales independientes:
+
+      Señal 1 — Similitud de imagen (aHash + ORB):
+        Compara la selfie vs el frente del documento a nivel de píxeles/features.
+        Alta similitud → las imágenes se parecen mucho visualmente.
+
+      Señal 2 — Similitud facial (FaceNet embedding, ya calculada):
+        Compara los rostros extraídos. Si es >95% → los embeddings son casi
+        idénticos, lo que indica que es literalmente la misma foto de cara.
+
+    Lógica de decisión:
+      • imagen_sim >= 92% AND facial_sim >= 95%  → "identical_image" (fraude real)
+        Ambas señales disparan → la selfie es la misma foto que el documento.
+
+      • imagen_sim >= 85% AND facial_sim < 95%   → "photo_of_screen" (sospechoso)
+        La imagen se parece mucho pero los embeddings difieren → posiblemente una
+        foto tomada con el celular mostrando el documento en pantalla. No es fraude
+        confirmado pero es sospechoso y merece revisión manual.
+
+      • imagen_sim < 85%                         → "none" (sin fraude)
+        Las imágenes son visualmente diferentes → no hay fraude de imagen.
+
+    Args:
+        selfie_img           : imagen OpenCV de la selfie
+        doc_img              : imagen OpenCV del frente del documento
+        face_similarity_pct  : score 0-100 de la comparación facial FaceNet (ya calculado)
+        face_state           : "both"|"selfie"|"id"|"none" — calidad de detección
 
     Returns:
-        (image_similarity_score, is_fraud)
+        (image_similarity_score, is_fraud, fraud_reason)
+        fraud_reason: "identical_image" | "photo_of_screen" | "none"
     """
-    score    = _doc_similarity_score(selfie_img, doc_img)
-    is_fraud = score >= SELFIE_DOC_FRAUD_THRESHOLD
-    logger.info("[FRAUD] selfie-vs-doc score=%.1f%% → is_fraud=%s", score, is_fraud)
-    return score, is_fraud
+    img_score = _doc_similarity_score(selfie_img, doc_img)
+
+    # Solo podemos afirmar "identical_image" si ambas caras fueron detectadas
+    # correctamente (face_state = "both"). Si no hay detección facial fiable,
+    # no elevamos a fraude confirmado aunque la imagen sea muy parecida.
+    face_detected_both = face_state == "both"
+
+    if img_score >= SELFIE_DOC_FRAUD_THRESHOLD and face_detected_both and face_similarity_pct >= FRAUD_FACE_IDENTICAL_THRESHOLD:
+        # Ambas señales altas → misma foto subida dos veces
+        reason   = "identical_image"
+        is_fraud = True
+
+    elif img_score >= FRAUD_IMAGE_HIGH_THRESHOLD:
+        # Imagen muy parecida pero embedding facial difiere (o no hay detección) →
+        # foto del documento tomada desde una pantalla de celular u otro artefacto
+        reason   = "photo_of_screen"
+        is_fraud = False  # sospechoso pero no bloquear automáticamente
+
+    else:
+        reason   = "none"
+        is_fraud = False
+
+    logger.info(
+        "[FRAUD] img_score=%.1f%% face_sim=%.1f%% face_state=%s → reason=%s is_fraud=%s",
+        img_score,
+        face_similarity_pct if face_similarity_pct is not None else -1,
+        face_state,
+        reason,
+        is_fraud,
+    )
+    return img_score, is_fraud, reason
 
 
 # ---------------------------------------------------------------------------
@@ -446,8 +512,18 @@ def verify_identity(data: VerificationRequest):
         else:
             threshold_used = FACE_THRESHOLD_ONE
 
-        # ── Fraude: selfie idéntica al documento (Opción C) ─────────────
-        selfie_doc_sim, is_selfie_fraud = detect_selfie_document_fraud(selfie_img, id_img)
+        # ── Fraude: selfie idéntica al documento (Opción C mejorada) ────
+        # Pasamos face_similarity_pct y face_state para la lógica combinada.
+        # detect_selfie_document_fraud ahora distingue entre:
+        #   "identical_image"  → misma foto subida dos veces (fraude real)
+        #   "photo_of_screen"  → foto tomada de pantalla con el doc (sospechoso)
+        #   "none"             → sin fraude detectado
+        selfie_doc_sim, is_selfie_fraud, fraud_reason = detect_selfie_document_fraud(
+            selfie_img,
+            id_img,
+            face_similarity_pct=similarity_pct if similarity_pct is not None else 0.0,
+            face_state=face_state,
+        )
 
         # ── OCR + matching de campos ─────────────────────────────────────
         logger.info("[VERIFY] form_data: %s", data.form_data)
@@ -484,8 +560,9 @@ def verify_identity(data: VerificationRequest):
             "is_same_person":       is_same_person,
 
             # ── Fraude selfie = documento (Opción C) ─────────────────────
-            "is_selfie_fraud":      is_selfie_fraud,
+            "is_selfie_fraud":       is_selfie_fraud,
             "selfie_doc_similarity": selfie_doc_sim,
+            "fraud_reason":          fraud_reason,
 
             # ── Campos del formulario ────────────────────────────────────
             "field_matches": field_matches,

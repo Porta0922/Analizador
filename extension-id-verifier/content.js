@@ -372,12 +372,21 @@ function renderResults(res) {
 
   // ── Alertas críticas (Opciones A, B, C) ──────────────────────────────────
 
-  // [Opción C] Fraude: selfie = documento
-  if (res.is_selfie_fraud) {
+  // [Opción C] Fraude: selfie = documento — mensaje según causa
+  if (res.is_selfie_fraud && res.fraud_reason === "identical_image") {
     badge.appendChild(_makeAlert(
-      `⚠️ FRAUDE DETECTADO: La selfie y el documento son la misma imagen (similitud ${res.selfie_doc_similarity}%). ` +
-      "Por favor verificar manualmente.",
+      `FRAUDE DETECTADO: la selfie y el documento frontal son la misma imagen ` +
+      `(similitud imagen: ${res.selfie_doc_similarity}%, similitud facial: ${res.facial_similarity}%). ` +
+      "Requiere verificación manual inmediata.",
       "220,53,69", "🚨"
+    ));
+  } else if (res.fraud_reason === "photo_of_screen") {
+    // Sospechoso pero no bloqueante: imagen muy parecida pero embeddings distintos
+    badge.appendChild(_makeAlert(
+      `Posible foto del documento desde pantalla de celular ` +
+      `(similitud imagen: ${res.selfie_doc_similarity}%). ` +
+      "La selfie debería ser una foto de la persona, no del carnet. Verificar manualmente.",
+      "255,152,0", "�"
     ));
   }
 
