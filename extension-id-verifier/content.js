@@ -314,6 +314,98 @@ function clearHighlight() {
 }
 
 // ---------------------------------------------------------------------------
+// Dibujo de bounding box + landmarks de rostro sobre la imagen real del DOM
+// (Opción de zoom facial — los datos vienen del backend en la respuesta)
+// ---------------------------------------------------------------------------
+
+/**
+ * Dibuja un recuadro y landmarks sobre una <img> del DOM usando las
+ * coordenadas normalizadas (0-1) devueltas por el backend.
+ *
+ * @param {HTMLImageElement} imgEl  - el elemento <img> en la página
+ * @param {Object}           box    - {x_norm, y_norm, w_norm, h_norm, method}
+ * @param {Array}            landmarks - [{name, x_norm, y_norm}, ...]
+ * @param {string}           color  - color del recuadro (CSS)
+ * @param {string}           boxId  - id único para poder limpiar después
+ */
+function drawFaceDetection(imgEl, box, landmarks, color, boxId) {
+  if (!imgEl || !box) return;
+
+  const parent = imgEl.offsetParent || imgEl.parentElement;
+  if (!parent) return;
+  parent.style.position = "relative";
+
+  // Limpiar overlay anterior con el mismo id
+  document.querySelectorAll(`[data-face-overlay="${boxId}"]`).forEach((e) => e.remove());
+
+  // Dimensiones renderizadas del <img> en el DOM
+  const rect    = imgEl.getBoundingClientRect();
+  const pRect   = parent.getBoundingClientRect();
+  const imgLeft = rect.left - pRect.left;
+  const imgTop  = rect.top  - pRect.top;
+  const imgW    = rect.width;
+  const imgH    = rect.height;
+
+  // Convertir coordenadas normalizadas a píxeles del DOM
+  const px = (norm) => norm * imgW;
+  const py = (norm) => norm * imgH;
+
+  const container = document.createElement("div");
+  container.setAttribute("data-face-overlay", boxId);
+  container.style.cssText =
+    `position:absolute;` +
+    `left:${imgLeft}px;top:${imgTop}px;` +
+    `width:${imgW}px;height:${imgH}px;` +
+    `pointer-events:none;z-index:99999;`;
+
+  // ── Bounding box ────────────────────────────────────────────────────────
+  const boxEl = document.createElement("div");
+  const bx = px(box.x_norm), by = py(box.y_norm);
+  const bw = px(box.w_norm), bh = py(box.h_norm);
+
+  boxEl.style.cssText =
+    `position:absolute;` +
+    `left:${bx}px;top:${by}px;width:${bw}px;height:${bh}px;` +
+    `border:2px solid ${color};box-sizing:border-box;` +
+    `box-shadow:0 0 0 1px rgba(0,0,0,0.5);`;
+
+  // Label con método de detección y probabilidad
+  const methodLabel = document.createElement("div");
+  const methodText  = box.method === "mtcnn"
+    ? `MTCNN ${box.prob != null ? (box.prob * 100).toFixed(0) + "%" : ""}`
+    : `HAAR ${box.prob != null ? (box.prob * 100).toFixed(0) + "%" : ""}`;
+  methodLabel.style.cssText =
+    `position:absolute;top:-17px;left:0;` +
+    `background:${color};color:#000;font:bold 9px/16px monospace;` +
+    `padding:0 4px;white-space:nowrap;`;
+  methodLabel.textContent = methodText;
+  boxEl.appendChild(methodLabel);
+  container.appendChild(boxEl);
+
+  // ── Landmarks ─────────────────────────────────────────────────────────
+  if (landmarks && landmarks.length > 0) {
+    landmarks.forEach((lm) => {
+      const dot = document.createElement("div");
+      const lx  = px(lm.x_norm);
+      const ly  = py(lm.y_norm);
+      dot.title = lm.name;
+      dot.style.cssText =
+        `position:absolute;` +
+        `left:${lx - 3}px;top:${ly - 3}px;` +
+        `width:6px;height:6px;border-radius:50%;` +
+        `background:${color};box-shadow:0 0 0 1px rgba(0,0,0,0.6);`;
+      container.appendChild(dot);
+    });
+  }
+
+  parent.appendChild(container);
+}
+
+function clearFaceOverlays() {
+  document.querySelectorAll("[data-face-overlay]").forEach((e) => e.remove());
+}
+
+// ---------------------------------------------------------------------------
 // Helpers para construir alertas inline dentro del badge
 // ---------------------------------------------------------------------------
 
@@ -466,6 +558,34 @@ function renderResults(res) {
       input.classList.remove("valid-field", "invalid-field");
       input.classList.add(isMatch ? "valid-field" : "invalid-field");
     }
+  }
+
+  // ── Dibujar bounding boxes y landmarks sobre las imágenes del DOM ─────────
+  // Los datos vienen del backend (coordenadas normalizadas 0-1).
+  // Se usan las referencias a los <img> guardadas por collectImages().
+  clearFaceOverlays();
+
+  const selfieImgEl = debugSelection.selfieImg;
+  const idImgEl     = debugSelection.idImg;
+
+  if (selfieImgEl && res.selfie_face_box) {
+    drawFaceDetection(
+      selfieImgEl,
+      res.selfie_face_box,
+      res.selfie_face_landmarks || [],
+      "#4caf50",   // verde
+      "selfie-face"
+    );
+  }
+
+  if (idImgEl && res.id_face_box) {
+    drawFaceDetection(
+      idImgEl,
+      res.id_face_box,
+      res.id_face_landmarks || [],
+      "#4caf50",   // verde — naranja si calidad degradada
+      "id-face"
+    );
   }
 }
 
@@ -753,6 +873,7 @@ function clearFeedback() {
   document.querySelectorAll(".valid-field, .invalid-field").forEach((el) => {
     el.classList.remove("valid-field", "invalid-field");
   });
+  clearFaceOverlays();
 }
 
 function currentSelfieImg() {

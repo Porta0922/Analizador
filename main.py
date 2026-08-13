@@ -151,10 +151,16 @@ def _cv2_to_rgb(cv2_img):
     return cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
 
 
-def _haar_fallback_embedding(cv2_img):
-    """Haar cascade fallback para fotos de cédula pequeñas donde MTCNN falla."""
+def _haar_detect_box(cv2_img):
+    """
+    Intenta detectar un rostro con Haar cascade.
+    Retorna (x, y, w, h) del rostro más grande encontrado, o None.
+    Hace upscale si la imagen es muy pequeña.
+    """
     gray    = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
     min_dim = min(gray.shape)
+    scale   = 1.0
+
     if min_dim < 200:
         scale   = max(2.0, round(300 / min_dim))
         gray    = cv2.resize(gray,    None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
@@ -163,41 +169,147 @@ def _haar_fallback_embedding(cv2_img):
     for g in (gray, cv2.equalizeHist(gray)):
         faces = face_cascade.detectMultiScale(g, scaleFactor=1.05, minNeighbors=3, minSize=(20, 20))
         if len(faces) > 0:
-            x, y, w, h  = max(faces, key=lambda r: r[2] * r[3])
-            face_roi     = cv2_img[y:y + h, x:x + w]
-            face_roi     = cv2.resize(face_roi, (160, 160), interpolation=cv2.INTER_LINEAR)
-            rgb          = _cv2_to_rgb(face_roi)
-            tensor       = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-            tensor       = (tensor - 0.5) / 0.25
-            with torch.no_grad():
-                emb = face_net(tensor.unsqueeze(0).to(device))
-            return emb, True
+            x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
+            # Reescalar coordenadas a la imagen original si hubo upscale
+            if scale != 1.0:
+                x, y, w, h = int(x/scale), int(y/scale), int(w/scale), int(h/scale)
+            return x, y, w, h
 
-    return None, False
+    return None
+
+
+def _crop_face_from_box(cv2_img, x, y, w, h, padding_ratio: float = 0.20):
+    """
+    Recorta la región del rostro con un padding proporcional.
+    padding_ratio=0.20 agrega un 20% de margen alrededor del bounding box.
+    Útil para mejorar el embedding al incluir contexto del rostro.
+    """
+    H, W = cv2_img.shape[:2]
+    pad_x = int(w * padding_ratio)
+    pad_y = int(h * padding_ratio)
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(W, x + w + pad_x)
+    y2 = min(H, y + h + pad_y)
+    return cv2_img[y1:y2, x1:x2]
+
+
+def _embedding_from_crop(face_crop_cv2):
+    """
+    Genera embedding FaceNet desde un recorte de cara (imagen OpenCV).
+    Intenta MTCNN primero sobre el recorte; si falla, normaliza directo.
+    """
+    rgb         = _cv2_to_rgb(face_crop_cv2)
+    face_tensor = mtcnn(rgb)
+    if face_tensor is not None:
+        with torch.no_grad():
+            return face_net(face_tensor.unsqueeze(0).to(device))
+
+    # Fallback: redimensionar el recorte directamente a 160×160
+    small  = cv2.resize(rgb, (160, 160))
+    tensor = torch.from_numpy(small).permute(2, 0, 1).float() / 255.0
+    tensor = (tensor - 0.5) / 0.25
+    with torch.no_grad():
+        return face_net(tensor.unsqueeze(0).to(device))
 
 
 def extract_face_embedding(cv2_img):
     """
     Detecta rostro y extrae embedding 512-dim.
-    Retorna (embedding, face_detected:bool).
-    face_detected=False indica embedding de baja confianza (imagen completa).
+
+    Retorna:
+        embedding     : tensor
+        face_detected : bool — True si se detectó un rostro real
+        box           : dict {x, y, w, h, x_norm, y_norm, w_norm, h_norm} o None
+        landmarks     : lista de 5 puntos [{x,y}, ...] o None
+
+    Orden de intentos:
+      1. MTCNN detect() → bounding box + landmarks + recorte mejorado con padding
+      2. Haar cascade   → bounding box + recorte mejorado
+      3. Imagen completa como último recurso
     """
     if cv2_img is None:
-        return None, False
+        return None, False, None, None
 
-    rgb = _cv2_to_rgb(cv2_img)
+    H, W  = cv2_img.shape[:2]
+    rgb   = _cv2_to_rgb(cv2_img)
 
-    # Nivel 1: MTCNN (más preciso)
-    face_tensor = mtcnn(rgb)
-    if face_tensor is not None:
-        with torch.no_grad():
-            emb = face_net(face_tensor.unsqueeze(0).to(device))
-        return emb, True
+    # ── Nivel 1: MTCNN con detección de box y landmarks ─────────────────────
+    try:
+        boxes, probs, points = mtcnn.detect(rgb, landmarks=True)
 
-    # Nivel 2: Haar cascade (fotos pequeñas de cédula)
-    emb, ok = _haar_fallback_embedding(cv2_img)
-    if emb is not None:
-        return emb, ok
+        if boxes is not None and len(boxes) > 0 and probs[0] is not None:
+            # Tomar la detección de mayor probabilidad
+            best_idx = int(np.argmax(probs))
+            box_raw  = boxes[best_idx]      # [x1, y1, x2, y2]
+            prob     = float(probs[best_idx])
+
+            if prob >= 0.90:
+                x1, y1, x2, y2 = [int(v) for v in box_raw]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(W, x2), min(H, y2)
+
+                box = {
+                    "x": x1, "y": y1,
+                    "w": x2 - x1, "h": y2 - y1,
+                    # Coordenadas normalizadas 0-1 para el frontend
+                    "x_norm": round(x1 / W, 4),
+                    "y_norm": round(y1 / H, 4),
+                    "w_norm": round((x2 - x1) / W, 4),
+                    "h_norm": round((y2 - y1) / H, 4),
+                    "prob":   round(prob, 3),
+                    "method": "mtcnn",
+                }
+
+                # Landmarks: array (N, 5, 2) → lista de 5 puntos {x, y, x_norm, y_norm}
+                lm_raw   = points[best_idx]   # shape (5, 2): ojos, nariz, comisuras boca
+                lm_names = ["eye_left", "eye_right", "nose", "mouth_left", "mouth_right"]
+                landmarks = [
+                    {
+                        "name":   lm_names[i],
+                        "x":      int(lm_raw[i][0]),
+                        "y":      int(lm_raw[i][1]),
+                        "x_norm": round(float(lm_raw[i][0]) / W, 4),
+                        "y_norm": round(float(lm_raw[i][1]) / H, 4),
+                    }
+                    for i in range(5)
+                ]
+
+                # Recortar con padding y generar embedding de mayor calidad
+                face_crop = _crop_face_from_box(cv2_img, x1, y1, x2 - x1, y2 - y1, padding_ratio=0.15)
+                emb       = _embedding_from_crop(face_crop)
+                logger.info("[FACE] MTCNN box=[%d,%d,%d,%d] prob=%.2f", x1, y1, x2, y2, prob)
+                return emb, True, box, landmarks
+
+    except Exception as e:
+        logger.warning("[FACE] MTCNN detect() failed: %s — falling back to Haar", str(e))
+
+    # ── Nivel 2: Haar cascade ────────────────────────────────────────────────
+    haar_result = _haar_detect_box(cv2_img)
+    if haar_result is not None:
+        x, y, w, h = haar_result
+        box = {
+            "x": x, "y": y, "w": w, "h": h,
+            "x_norm": round(x / W, 4),
+            "y_norm": round(y / H, 4),
+            "w_norm": round(w / W, 4),
+            "h_norm": round(h / H, 4),
+            "prob":   0.70,
+            "method": "haar",
+        }
+        face_crop = _crop_face_from_box(cv2_img, x, y, w, h, padding_ratio=0.15)
+        emb       = _embedding_from_crop(face_crop)
+        logger.info("[FACE] Haar box=[%d,%d,%d,%d]", x, y, w, h)
+        return emb, True, box, None
+
+    # ── Nivel 3: imagen completa como último recurso ─────────────────────────
+    small  = cv2.resize(rgb, (160, 160))
+    tensor = torch.from_numpy(small).permute(2, 0, 1).float() / 255.0
+    tensor = (tensor - 0.5) / 0.25
+    with torch.no_grad():
+        emb = face_net(tensor.unsqueeze(0).to(device))
+    logger.info("[FACE] Fallback: full-image embedding (no face detected)")
+    return emb, False, None, None
 
     # Nivel 3: imagen completa como último recurso
     small  = cv2.resize(rgb, (160, 160))
@@ -222,12 +334,16 @@ def calculate_similarity(img1, img2):
         face_state      : "both" | "selfie" | "id" | "none"
         is_same_person  : bool — usa threshold dinámico según face_state
         face_quality    : "high" | "degraded" | "failed"
+        selfie_box      : dict con bounding box de la selfie (o None)
+        selfie_landmarks: lista de 5 landmarks de la selfie (o None)
+        id_box          : dict con bounding box del documento (o None)
+        id_landmarks    : lista de 5 landmarks del documento (o None)
     """
-    emb1, ok1 = extract_face_embedding(img1)
-    emb2, ok2 = extract_face_embedding(img2)
+    emb1, ok1, box1, lm1 = extract_face_embedding(img1)
+    emb2, ok2, box2, lm2 = extract_face_embedding(img2)
 
     if emb1 is None or emb2 is None:
-        return None, "none", False, "failed"
+        return None, "none", False, "failed", None, None, None, None
 
     if ok1 and ok2:
         state   = "both"
@@ -243,14 +359,13 @@ def calculate_similarity(img1, img2):
 
     # Opción A — threshold dinámico
     if state == "none":
-        # Ninguna cara detectada → rechazar independientemente del score
         is_match = False
     elif state == "both":
         is_match = sim_pct >= FACE_THRESHOLD_BOTH
     else:
         is_match = sim_pct >= FACE_THRESHOLD_ONE
 
-    return sim_pct, state, is_match, quality
+    return sim_pct, state, is_match, quality, box1, lm1, box2, lm2
 
 
 # ---------------------------------------------------------------------------
@@ -501,12 +616,13 @@ def verify_identity(data: VerificationRequest):
             )
 
         # ── Similitud facial con threshold dinámico (Opción A) ──────────
-        similarity_pct, face_state, is_same_person, face_quality = calculate_similarity(
+        similarity_pct, face_state, is_same_person, face_quality, \
+            selfie_box, selfie_landmarks, id_box, id_landmarks = calculate_similarity(
             selfie_img, id_img
         )
 
         if face_state == "none":
-            threshold_used = FACE_THRESHOLD_BOTH  # referencia, pero se rechazó por calidad
+            threshold_used = FACE_THRESHOLD_BOTH
         elif face_state == "both":
             threshold_used = FACE_THRESHOLD_BOTH
         else:
@@ -558,6 +674,12 @@ def verify_identity(data: VerificationRequest):
             "face_threshold_used":  threshold_used,
             "facial_similarity":    similarity_pct,
             "is_same_person":       is_same_person,
+
+            # ── Bounding boxes y landmarks (para dibujar en la extensión) ─
+            "selfie_face_box":       selfie_box,
+            "selfie_face_landmarks": selfie_landmarks,
+            "id_face_box":           id_box,
+            "id_face_landmarks":     id_landmarks,
 
             # ── Fraude selfie = documento (Opción C) ─────────────────────
             "is_selfie_fraud":       is_selfie_fraud,
