@@ -57,11 +57,12 @@ class DocumentAnalyzer:
         """Load prompt templates from files."""
         self.prompts = {}
         prompt_files = {
-            "analyze_document":    "analyze_document.txt",
-            "validate_coherence":  "validate_coherence.txt",
-            "detect_tampering":    "detect_tampering.txt",
-            "verify_face_match":   "verify_face_match.txt",
-            "verify_back_document":"verify_back_document.txt",
+            "analyze_document":      "analyze_document.txt",
+            "validate_coherence":    "validate_coherence.txt",
+            "detect_tampering":      "detect_tampering.txt",
+            "verify_face_match":     "verify_face_match.txt",
+            "verify_back_document":  "verify_back_document.txt",
+            "extract_fields_visual": "extract_fields_visual.txt",
         }
         for key, filename in prompt_files.items():
             prompt_path = PROMPTS_DIR / filename
@@ -100,7 +101,7 @@ class DocumentAnalyzer:
     # reglas de dominio de texto ni patrones aprendidos de campos de formulario.
     # Agregarles LOCALE_RULES confunde al modelo (llava devuelve esas reglas
     # en su reasoning y corrompe el JSON de respuesta).
-    _VISUAL_ONLY_PROMPTS = {"verify_face_match", "verify_back_document"}
+    _VISUAL_ONLY_PROMPTS = {"verify_face_match", "verify_back_document", "extract_fields_visual"}
 
     def _build_system_prompt(self, base_prompt_key: str, form_data: Optional[dict] = None) -> str:
         """
@@ -238,14 +239,17 @@ class DocumentAnalyzer:
         doc_front_b64: str,
         doc_back_b64: Optional[str],
         form_data: dict,
+        ocr_field_matches: Optional[Dict[str, Optional[bool]]] = None,
     ) -> AIAnalysis:
         """
         Pipeline completo de análisis:
           1. Coherencia de datos del formulario (texto + Ollama)
           2. Detección de tampering en el frente (visión llava)
-          3. Análisis facial: selfie vs foto del documento (visión llava) [Opción D]
-          4. Verificación del dorso del documento (visión llava) [Opción D]
-          5. Cálculo de confianza global ponderando los 4 factores
+          3. Análisis facial: selfie vs foto del documento (visión llava)
+          4. Verificación del dorso del documento (visión llava)
+          5. [NUEVO] Etapa 2 de verificación de campos: llava extrae visualmente
+             los campos que el OCR no pudo confirmar y los re-evalúa
+          6. Cálculo de confianza global ponderando los 4 factores
         """
         logger.info("[AI] Starting coherence analysis...")
         coherence = self._analyze_coherence(form_data)
@@ -255,17 +259,52 @@ class DocumentAnalyzer:
         tampering = self._detect_tampering(doc_front_b64)
         logger.info("[AI] Tampering result: %s", tampering)
 
-        # Opción D — Análisis facial por IA
+        # Análisis facial por IA
         logger.info("[AI] Starting face match analysis...")
         face_match = self._analyze_face_match(selfie_b64, doc_front_b64)
         logger.info("[AI] Face match result: %s", face_match)
 
-        # Opción D — Verificación del dorso
+        # Verificación del dorso
         back_analysis: Optional[dict] = None
         if doc_back_b64:
             logger.info("[AI] Starting back document verification...")
             back_analysis = self._verify_back_document(doc_back_b64)
             logger.info("[AI] Back document result: %s", back_analysis)
+
+        # ── Etapa 2: extracción visual de campos que el OCR no confirmó ───────
+        visual_field_matches: Dict[str, Optional[bool]] = {}
+        visual_extracted: Dict[str, str] = {}
+
+        if form_data and ocr_field_matches is not None:
+            # Campos que OCR marcó como False (falló) o None (no aplicable)
+            # Solo re-intentamos los que son False — los None son no-verificables
+            failed_fields = {
+                field: value
+                for field, value in form_data.items()
+                if ocr_field_matches.get(field) is False and value
+            }
+
+            if failed_fields:
+                logger.info("[AI] Etapa 2: enviando %d campos fallidos a llava: %s",
+                            len(failed_fields), list(failed_fields.keys()))
+                visual_result = self._extract_fields_visual(doc_front_b64, failed_fields)
+                visual_extracted = visual_result.get("extracted_fields", {})
+
+                # Re-evaluar cada campo con lo que llava extrajo
+                for field, expected_value in failed_fields.items():
+                    extracted = visual_extracted.get(field)
+                    if extracted is None:
+                        visual_field_matches[field] = False  # llava tampoco lo vio
+                    else:
+                        # Comparación normalizada (sin tildes, mayúsculas, sin separadores)
+                        match = self._fuzzy_field_match(field, expected_value, extracted)
+                        visual_field_matches[field] = match
+                        logger.info("[AI] Campo '%s': OCR=False → llava='%s' → match=%s",
+                                    field, extracted, match)
+            else:
+                logger.info("[AI] Etapa 2: no hay campos fallidos para re-evaluar con llava")
+        else:
+            logger.info("[AI] Etapa 2: omitida (no hay ocr_field_matches)")
 
         overall = self._calculate_overall_confidence(coherence, tampering, face_match, back_analysis)
 
@@ -283,8 +322,11 @@ class DocumentAnalyzer:
         back_score       = back_analysis.get("back_score", -1)   if isinstance(back_analysis, dict) else -1
         back_issues      = back_analysis.get("issues", [])        if isinstance(back_analysis, dict) else []
 
-        coherence_reasoning = coherence.get("reasoning", "")     if isinstance(coherence, dict)  else ""
+        coherence_reasoning = coherence.get("reasoning", "")         if isinstance(coherence, dict)  else ""
         tampering_reasoning = tampering.get("overall_assessment", "") if isinstance(tampering, dict) else ""
+
+        # Merge extracted_data con lo que extrajo llava en etapa 2
+        extracted_data.update(visual_extracted)
 
         return AIAnalysis(
             coherence_score=coherence_score,
@@ -299,6 +341,7 @@ class DocumentAnalyzer:
             face_match_reasoning=face_reasoning,
             back_analysis_score=back_score,
             back_analysis_issues=back_issues,
+            visual_field_matches=visual_field_matches,
         )
 
     def _analyze_coherence(self, form_data: dict) -> dict:
