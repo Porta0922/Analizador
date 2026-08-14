@@ -64,7 +64,9 @@ function selectFileInput(predicate) {
 }
 
 async function collectImages() {
-  const images = Array.from(document.querySelectorAll("img")).filter((i) => i.src);
+  const images = Array.from(document.querySelectorAll("img")).filter(
+    (i) => i.src && (i.naturalWidth === 0 || i.naturalWidth > 50) && (i.naturalHeight === 0 || i.naturalHeight > 50)
+  );
   console.info("[id-verifier] Imágenes en el DOM:", images.map((i) => i.src).join(", "));
 
   const missing = {
@@ -79,24 +81,30 @@ async function collectImages() {
   // y luego localiza el <img> más cercano dentro del mismo contenedor.
   const LABEL_MAP = [
     { slot: "selfie", hints: ["selfie", "foto personal", "rostro"] },
-    { slot: "id",     hints: ["documento frente", "cip frente", "frente", "documento"] },
-    { slot: "idBack", hints: ["documento dorso", "cip dorso", "dorso", "reverso"] },
+    { slot: "id",     hints: ["documento frente", "cip frente", "frente de la cedula", "frente documento", "frente"] },
+    { slot: "idBack", hints: ["documento dorso", "cip dorso", "dorso documento", "dorso", "reverso"] },
   ];
 
   function findImgNearLabel(hintWords) {
     const allText = Array.from(document.querySelectorAll(
-      "h1,h2,h3,h4,h5,h6,p,span,label,div,td,th,b,strong"
+      "h1,h2,h3,h4,h5,h6,p,span,label,td,th,b,strong"
     ));
     for (const el of allText) {
+      // Ignorar nodos con muchísimo texto (probablemente contenedores principales)
+      if ((el.textContent || "").length > 60) continue;
       const norm = normalize(el.textContent);
       if (hintWords.some((h) => norm === normalize(h) || norm.includes(normalize(h)))) {
-        // Buscar <img> dentro del mismo padre o en el siguiente contenedor hermano
-        const parent = el.closest("div, td, section, article, figure") || el.parentElement;
-        if (!parent) continue;
-        // Buscar en el padre y en el padre del padre
-        for (const container of [parent, parent.parentElement].filter(Boolean)) {
-          const img = container.querySelector("img");
-          if (img && img.src && !used.has(img)) return img;
+        // Buscar el <img> más cercano en los contenedores padres directos
+        let parent = el.parentElement;
+        let depth = 0;
+        while (parent && depth < 3) {
+          const imgs = Array.from(parent.querySelectorAll("img")).filter(
+            (i) => i.src && (i.naturalWidth === 0 || i.naturalWidth > 50)
+          );
+          const validImg = imgs.find((i) => !used.has(i));
+          if (validImg) return validImg;
+          parent = parent.parentElement;
+          depth++;
         }
       }
     }
@@ -122,13 +130,32 @@ async function collectImages() {
   const idInput     = selectFileInput((s) => matchesHints(s, CONFIG.ID_HINTS));
   const backInput   = selectFileInput((s) => matchesHints(s, CONFIG.BACK_HINTS));
 
+  // Busca la imagen preview (<img>) más cercana a un <input type=file> en el DOM
+  function findPreviewImgNearInput(input) {
+    const parent = input.closest("div, td, section, article, figure, form") || input.parentElement;
+    if (!parent) return null;
+    for (const container of [parent, parent.parentElement, parent.parentElement && parent.parentElement.parentElement].filter(Boolean)) {
+      const img = container.querySelector("img");
+      if (img && img.src && !used.has(img)) return img;
+    }
+    return null;
+  }
+
   const setFromInput = async (slot, input) => {
     if (!input || missing[slot].b64) return;
     const b64 = await readInputFile(input);
     if (b64) {
       missing[slot].b64 = b64;
-      missing[slot].img = null;
-      console.info("[id-verifier] desde input:", input.name || input.id);
+      // Intentar encontrar la imagen preview cercana al input
+      const previewImg = findPreviewImgNearInput(input);
+      if (previewImg) {
+        missing[slot].img = previewImg;
+        used.add(previewImg);
+        console.info("[id-verifier] desde input (con preview img):", input.name || input.id);
+      } else {
+        missing[slot].img = null;
+        console.info("[id-verifier] desde input (sin preview img):", input.name || input.id);
+      }
     }
   };
   await setFromInput("selfie", selfieInput);
@@ -165,7 +192,7 @@ async function collectImages() {
   // Detecta imágenes cuyas rutas contienen keywords conocidos del formulario
   const SERVER_PATTERNS = [
     { slot: "selfie", patterns: [/selfie/i, /rostro/i, /SELFIE/] },
-    { slot: "id",     patterns: [/CIP_FRENTE/i, /frente/i, /front/i, /documento/i] },
+    { slot: "id",     patterns: [/CIP_FRENTE/i, /frente/i, /front/i] },
     { slot: "idBack", patterns: [/CIP_DORSO/i, /dorso/i, /back/i, /reverso/i] },
   ];
   for (const { slot, patterns } of SERVER_PATTERNS) {
@@ -185,17 +212,41 @@ async function collectImages() {
     }
   }
 
-  // ── Estrategia 4: cualquier <img> legible — fallback general ──────────────
+  // ── Estrategia 4: <img> dentro de contenedores de previsualización de imágenes ───
   for (const slot of ["selfie", "id", "idBack"]) {
     if (missing[slot].b64) continue;
     for (const img of images) {
       if (used.has(img)) continue;
+      // Solo considerar <img> dentro de componentes o contenedores de imágenes/previsualización
+      const isPreview = Boolean(img.closest(".p-image, .p-image-preview-wrapper, [class*='image'], [class*='photo'], [class*='preview'], [class*='foto']"));
+      if (!isPreview) continue;
       used.add(img);
       const b64 = await imgToBase64(img);
       if (b64) {
         missing[slot].b64 = b64;
         missing[slot].img = img;
-        console.info(`[id-verifier] slot '${slot}' desde fallback general: ${img.src.slice(0, 80)}`);
+        console.info(`[id-verifier] slot '${slot}' desde preview container: ${img.src.slice(0, 80)}`);
+        break;
+      }
+    }
+  }
+
+  // ── Estrategia 5: recuperar img para slots con b64 pero sin img ───────────
+  // Ocurre cuando el slot se resolvió por input de archivo sin preview cercana.
+  // Usamos los patrones de URL del servidor para encontrar el <img> en el DOM.
+  const IMG_PATTERNS = [
+    { slot: "selfie", patterns: [/selfie/i, /rostro/i] },
+    { slot: "id",     patterns: [/CIP_FRENTE/i, /frente/i, /front/i] },
+    { slot: "idBack", patterns: [/CIP_DORSO/i, /dorso/i, /reverso/i, /back/i] },
+  ];
+  for (const { slot, patterns } of IMG_PATTERNS) {
+    if (!missing[slot].b64 || missing[slot].img) continue; // solo si falta img
+    for (const img of images) {
+      if (used.has(img)) continue;
+      if (patterns.some((p) => p.test(img.src))) {
+        missing[slot].img = img;
+        used.add(img);
+        console.info(`[id-verifier] img recuperada para slot '${slot}': ${img.src.slice(0, 80)}`);
         break;
       }
     }
@@ -367,7 +418,7 @@ let debugSelection = { selfieImg: null, idImg: null, idBackImg: null };
 function highlightSelection(selfieImg, idImg, idBackImg) {
   clearHighlight();
   if (selfieImg) drawDebugBox(selfieImg, "selfie-debug-box", "#2196f3", "SELFIE");
-  if (idImg) drawDebugBox(idImg, "id-debug-box", "#ff9800", "DOCUMENTO");
+  if (idImg) drawDebugBox(idImg, "id-debug-box", "#ff9800", "FRENTE");
   if (idBackImg) drawDebugBox(idBackImg, "idback-debug-box", "#9c27b0", "DORSO");
 }
 
